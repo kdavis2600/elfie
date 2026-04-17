@@ -15,6 +15,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.kizzle.hackathon",
+      "buildNumber": "1",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Elfie Scribe records consultations to generate a structured clinical note.",
         "NSCameraUsageDescription": "Elfie Scribe lets you photograph a blank clinic form to use as a PDF template.",
