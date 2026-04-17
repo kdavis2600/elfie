@@ -1,51 +1,66 @@
 import * as Haptics from "expo-haptics";
 import { router } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 
-import { BrandBackground } from "@/components/BrandBackground";
+import { AppScreen } from "@/components/AppScreen";
 import { PrimaryButton } from "@/components/PrimaryButton";
 import { ProgressSteps } from "@/components/ProgressSteps";
+import { ScreenIntro } from "@/components/ScreenIntro";
 import { SectionCard } from "@/components/SectionCard";
+import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
 import { colors, spacing, typography } from "@/constants/theme";
 import { processAudioAsync } from "@/lib/api";
 import { createMockReport } from "@/lib/mock";
 import { generateReportPdfAsync } from "@/lib/pdf";
+import { UI_PRIVACY_MODE_ENABLED } from "@/lib/privacy";
 import { useSession } from "@/lib/session";
 import { persistPdfAsync } from "@/lib/storage";
 
-const STEPS = ["Preparing audio", "Uploading", "Transcribing", "Structuring note", "Generating PDF"];
+const STEPS = ["Preparing recording", "Uploading audio", "Transcribing conversation", "Drafting note", "Preparing PDF"];
 
 export default function ProcessingScreen() {
-  const { pendingAudio, setPendingAudio, setReport } = useSession();
+  const { currentTemplate, pendingAudio, setPendingAudio, setReport } = useSession();
   const [activeStep, setActiveStep] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(true);
   const [attempt, setAttempt] = useState(0);
+  const completedRef = useRef(false);
+  const templateSnapshotRef = useRef(currentTemplate);
+
+  useEffect(() => {
+    if (pendingAudio) {
+      templateSnapshotRef.current = currentTemplate;
+    }
+  }, [currentTemplate, pendingAudio?.uri]);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function run() {
-      if (!pendingAudio) {
+    if (!pendingAudio) {
+      if (!completedRef.current) {
         router.replace("/");
-        return;
       }
+      return;
+    }
 
+    const audio = pendingAudio;
+    completedRef.current = false;
+
+    async function run() {
       try {
         setError(null);
         setIsRunning(true);
 
         setActiveStep(0);
-        const result = await processAudioAsync(pendingAudio);
+        const result = await processAudioAsync(audio);
         if (cancelled) {
           return;
         }
 
         setActiveStep(3);
-        const report = result.report ?? createMockReport(pendingAudio.sourceType);
-        const pdfTempUri = await generateReportPdfAsync(report);
+        const report = result.report ?? createMockReport(audio.sourceType);
+        const pdfTempUri = await generateReportPdfAsync(report, templateSnapshotRef.current);
         if (cancelled) {
           return;
         }
@@ -53,15 +68,20 @@ export default function ProcessingScreen() {
         setActiveStep(4);
         const pdfUri = await persistPdfAsync(pdfTempUri, `${report.id}.pdf`);
         await setReport(report, pdfUri);
-        setPendingAudio(null);
+        completedRef.current = true;
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        setPendingAudio(null);
         router.replace("/report");
       } catch (runError) {
         console.error(runError);
         const message = runError instanceof Error ? runError.message : "Audio processing failed.";
-        setError(message);
+        if (!cancelled) {
+          setError(message);
+        }
       } finally {
-        setIsRunning(false);
+        if (!cancelled) {
+          setIsRunning(false);
+        }
       }
     }
 
@@ -88,44 +108,53 @@ export default function ProcessingScreen() {
     return () => clearTimeout(timer);
   }, [activeStep, isRunning]);
 
+  function handleBackHome() {
+    setPendingAudio(null);
+    router.replace("/");
+  }
+
   return (
-    <BrandBackground>
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.container}>
-          <View style={styles.header}>
-            <Text style={styles.eyebrow}>Processing</Text>
-            <Text style={styles.title}>Turning the consultation into a polished note.</Text>
-            <Text style={styles.subtitle}>
-              Railway is orchestrating Qwen ASR and the structured extraction pass, then the app assembles the PDF locally.
+    <AppScreen contentStyle={styles.container}>
+      <StaggeredFadeIn index={0}>
+        <ScreenIntro
+          eyebrow="Preparing note"
+          title="Analyzing the consultation."
+          subtitle="Please keep the app open while the note and PDF are prepared."
+        >
+          {UI_PRIVACY_MODE_ENABLED ? (
+            <Text style={styles.privacyCopy}>
+              Privacy mode is on. Direct identifiers are redacted before structured extraction, and PDF export omits the
+              full transcript.
             </Text>
-          </View>
+          ) : null}
+        </ScreenIntro>
+      </StaggeredFadeIn>
 
-          <SectionCard eyebrow="Happy path" title={error ? "Something needs attention" : "Working through the pipeline"}>
-            <ProgressSteps activeStep={activeStep} steps={STEPS} />
-            {error ? (
-              <Text style={styles.error}>{error}</Text>
-            ) : (
-              <View style={styles.spinnerRow}>
-                <ActivityIndicator color={colors.accent} />
-                <Text style={styles.caption}>This usually takes one request cycle for ASR and one for report extraction.</Text>
-              </View>
-            )}
-          </SectionCard>
+      <StaggeredFadeIn index={1}>
+        <SectionCard eyebrow="In progress" title={error ? "We couldn't finish the note" : "Preparing your consultation note"}>
+          <ProgressSteps activeStep={activeStep} steps={STEPS} />
+          {error ? (
+            <Text style={styles.error}>{error}</Text>
+          ) : (
+            <View style={styles.spinnerRow}>
+              <ActivityIndicator color={colors.accent} />
+              <Text style={styles.caption}>This can take up to a couple of minutes for longer consultations.</Text>
+            </View>
+          )}
+        </SectionCard>
+      </StaggeredFadeIn>
 
-          <View style={styles.actions}>
-            {error ? <PrimaryButton label="Retry" onPress={() => setAttempt((value) => value + 1)} /> : null}
-            <PrimaryButton label="Back home" onPress={() => router.replace("/")} secondary />
-          </View>
+      <StaggeredFadeIn index={2}>
+        <View style={styles.actions}>
+          {error ? <PrimaryButton label="Retry" onPress={() => setAttempt((value) => value + 1)} /> : null}
+          <PrimaryButton label="Back home" onPress={handleBackHome} secondary />
         </View>
-      </SafeAreaView>
-    </BrandBackground>
+      </StaggeredFadeIn>
+    </AppScreen>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-  },
   container: {
     flex: 1,
     paddingHorizontal: spacing.xl,
@@ -134,25 +163,11 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: spacing.xl,
   },
-  header: {
-    gap: spacing.md,
-  },
-  eyebrow: {
-    ...typography.semibold,
-    color: colors.accent,
-    fontSize: 13,
-    textTransform: "uppercase",
-    letterSpacing: 0.8,
-  },
-  title: {
-    ...typography.title,
-    fontSize: 34,
-    lineHeight: 40,
-  },
-  subtitle: {
+  privacyCopy: {
     ...typography.body,
-    fontSize: 16,
-    lineHeight: 24,
+    fontSize: 15,
+    lineHeight: 22,
+    color: "#8a5a00",
   },
   spinnerRow: {
     flexDirection: "row",

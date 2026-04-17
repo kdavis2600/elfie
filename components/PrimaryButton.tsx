@@ -19,6 +19,9 @@ export function PrimaryButton({
 }: PrimaryButtonProps) {
   return (
     <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ disabled }}
+      android_ripple={{ color: secondary ? "rgba(20,20,43,0.08)" : "rgba(255,255,255,0.16)" }}
       disabled={disabled}
       onPress={onPress}
       style={({ pressed }) => [

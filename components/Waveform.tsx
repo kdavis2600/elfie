@@ -7,11 +7,13 @@ type WaveformProps = {
 };
 
 export function Waveform({ level }: WaveformProps) {
+  const bars = 20;
+
   return (
     <View style={styles.row}>
-      {Array.from({ length: 28 }).map((_, index) => {
-        const distance = Math.abs(index - 13.5);
-        const base = Math.max(0.16, 1 - distance / 14);
+      {Array.from({ length: bars }).map((_, index) => {
+        const distance = Math.abs(index - (bars - 1) / 2);
+        const base = Math.max(0.16, 1 - distance / (bars / 2));
         const height = 18 + base * 70 * level;
 
         return (
@@ -36,12 +38,14 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    gap: 5,
+    justifyContent: "center",
+    gap: 4,
     minHeight: 110,
   },
   bar: {
-    width: 8,
+    flex: 1,
+    maxWidth: 8,
+    minWidth: 3,
     borderRadius: 999,
   },
 });

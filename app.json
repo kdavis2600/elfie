@@ -16,7 +16,10 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.kizzle.hackathon",
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "Elfie Scribe records consultations to generate a structured clinical note."
+        "NSMicrophoneUsageDescription": "Elfie Scribe records consultations to generate a structured clinical note.",
+        "NSCameraUsageDescription": "Elfie Scribe lets you photograph a blank clinic form to use as a PDF template.",
+        "NSPhotoLibraryUsageDescription": "Elfie Scribe lets you choose a form image to use as a PDF template.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -43,7 +46,16 @@
       "expo-audio",
       "expo-mail-composer",
       "expo-font",
-      "expo-asset"
+      "expo-asset",
+      "expo-video",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Elfie Scribe lets you choose a form image to use as a PDF template.",
+          "cameraPermission": "Elfie Scribe lets you photograph a blank clinic form to use as a PDF template."
+        }
+      ],
+      "expo-document-picker"
     ],
     "extra": {
       "router": {},

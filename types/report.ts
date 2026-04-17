@@ -1,3 +1,10 @@
+export type TranscriptSegment = {
+  speaker: "doctor" | "patient" | "unknown";
+  startSec?: number;
+  endSec?: number;
+  text: string;
+};
+
 export type ConsultationReport = {
   id: string;
   createdAt: string;
@@ -9,6 +16,11 @@ export type ConsultationReport = {
   language: {
     detected: string;
     reportLanguage: string;
+  };
+  privacy?: {
+    mode: "standard" | "redacted";
+    transcriptRedacted?: boolean;
+    transcriptExcludedFromPdf?: boolean;
   };
   visit: {
     visitReason: string;
@@ -61,12 +73,7 @@ export type ConsultationReport = {
   };
   transcript: {
     fullText: string;
-    segments?: Array<{
-      speaker: "doctor" | "patient" | "unknown";
-      startSec?: number;
-      endSec?: number;
-      text: string;
-    }>;
+    segments?: TranscriptSegment[];
   };
 };
 

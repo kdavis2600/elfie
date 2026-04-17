@@ -23,7 +23,10 @@ export default function RootLayout() {
   });
 
   useEffect(() => {
-    Asset.loadAsync([require("../assets/branding/elfie-logo.png")]).catch(() => null);
+    Asset.loadAsync([
+      require("../assets/branding/elfie-logo.png"),
+      require("../assets/video/intro-optimized.mp4"),
+    ]).catch(() => null);
   }, []);
 
   useEffect(() => {

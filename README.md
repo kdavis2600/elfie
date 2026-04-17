@@ -29,6 +29,8 @@ Copy `.env.example` to `.env` locally and set:
 - `DASHSCOPE_API_KEY`: Alibaba Model Studio key
 - `QWEN_BASE_URL`: usually `https://dashscope-intl.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1`
 - `QWEN_MODEL`: extraction model, currently `qwen3.5-plus`
+- `PRIVACY_MODE`: privacy mode is on by default; set to `false` on the backend to disable redaction and include the full transcript in PDFs
+- `EXPO_PUBLIC_PRIVACY_MODE`: privacy-mode UI copy is on by default; set to `false` in Expo to hide the privacy-mode messaging
 
 Notes:
 
@@ -75,6 +77,7 @@ npx expo export --platform ios
 4. Wait for processing:
    - backend chunks long files if needed
    - Qwen ASR produces transcript text
+   - privacy mode is enabled by default, so the backend redacts direct identifiers before Qwen extraction unless explicitly disabled
    - Qwen extraction returns the `ConsultationReport`
    - the app generates and stores the PDF locally
 5. Review the note in-app and share or email the PDF.

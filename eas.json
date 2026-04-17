@@ -1,23 +1,36 @@
 {
   "cli": {
-    "version": ">= 18.4.0"
+    "version": ">= 18.4.0",
+    "appVersionSource": "remote"
   },
   "build": {
     "development": {
       "developmentClient": true,
-      "distribution": "internal"
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://elfie-scribe-api-production.up.railway.app"
+      }
     },
     "preview": {
-      "distribution": "internal"
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://elfie-scribe-api-production.up.railway.app"
+      }
     },
     "testflight": {
       "distribution": "store",
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://elfie-scribe-api-production.up.railway.app"
+      },
       "ios": {
         "simulator": false
       }
     },
     "production": {
-      "autoIncrement": true
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "https://elfie-scribe-api-production.up.railway.app"
+      }
     }
   },
   "submit": {

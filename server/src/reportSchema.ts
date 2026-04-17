@@ -12,6 +12,13 @@ export const consultationReportSchema = z.object({
     detected: z.string(),
     reportLanguage: z.string(),
   }),
+  privacy: z
+    .object({
+      mode: z.enum(["standard", "redacted"]),
+      transcriptRedacted: z.boolean().optional(),
+      transcriptExcludedFromPdf: z.boolean().optional(),
+    })
+    .optional(),
   visit: z.object({
     visitReason: z.string(),
     clinicianName: z.string().nullable().optional(),
