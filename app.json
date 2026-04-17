@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "name": "Elfie Scribe",
+    "slug": "elfie-scribe",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/branding/elfie-logo.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/branding/elfie-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#f7f7fc"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.kizzle.hackathon",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Elfie Scribe records consultations to generate a structured clinical note."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/branding/elfie-logo.png",
+        "backgroundColor": "#f7f7fc"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "scheme": "elfie-scribe",
+    "experiments": {
+      "typedRoutes": true
+    },
+    "plugins": [
+      "expo-router",
+      "expo-audio",
+      "expo-mail-composer",
+      "expo-font",
+      "expo-asset"
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "155c86b7-33d3-426b-9ff2-fb0fce14c960"
+      }
+    }
+  }
+}
