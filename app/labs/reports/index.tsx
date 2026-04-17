@@ -2,7 +2,6 @@ import { router } from "expo-router";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { AppScreen } from "@/components/AppScreen";
-import { PrimaryButton } from "@/components/PrimaryButton";
 import { ScreenIntro } from "@/components/ScreenIntro";
 import { SectionCard } from "@/components/SectionCard";
 import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
@@ -10,8 +9,8 @@ import { TopBackButton } from "@/components/TopBackButton";
 import { colors, radius, spacing, typography } from "@/constants/theme";
 import { useSession } from "@/lib/session";
 
-export default function PreviousReportsScreen() {
-  const { isHydrated, storedReports } = useSession();
+export default function PreviousLabReportsScreen() {
+  const { isHydrated, storedLabReports } = useSession();
 
   return (
     <AppScreen scroll contentContainerStyle={styles.content}>
@@ -20,8 +19,8 @@ export default function PreviousReportsScreen() {
           <TopBackButton label="Home" onPress={() => router.replace("/")} />
           <ScreenIntro
             eyebrow="History"
-            title="Previous reports"
-            subtitle="Open any saved consultation report and review the note or transcript."
+            title="Previous lab analyses"
+            subtitle="Open any saved lab analysis and review the prioritized findings, normalized rows, and sanitized source text."
           />
         </View>
       </StaggeredFadeIn>
@@ -30,23 +29,25 @@ export default function PreviousReportsScreen() {
         <StaggeredFadeIn index={1}>
           <ActivityIndicator color={colors.accent} />
         </StaggeredFadeIn>
-      ) : storedReports.length ? (
+      ) : storedLabReports.length ? (
         <StaggeredFadeIn index={1}>
           <View style={styles.list}>
-            {storedReports.map((stored, index) => (
+            {storedLabReports.map((stored, index) => (
               <StaggeredFadeIn key={stored.report.id} index={index} delayMs={60}>
                 <Pressable
                   accessibilityRole="button"
-                  onPress={() => router.push(`/reports/${encodeURIComponent(stored.report.id)}`)}
+                  onPress={() => router.push(`/labs/reports/${encodeURIComponent(stored.report.id)}`)}
                   style={({ pressed }) => [styles.reportPill, pressed && styles.reportPillPressed]}
                 >
                   <View style={styles.reportMetaRow}>
                     <Text style={styles.reportMeta}>{formatReportTime(stored.report.createdAt)}</Text>
                     <Text style={styles.reportMeta}>·</Text>
                     <Text style={styles.reportMeta}>{formatReportDate(stored.report.createdAt)}</Text>
+                    <Text style={styles.reportMeta}>·</Text>
+                    <Text style={styles.reportMeta}>{stored.report.processing.mode.replaceAll("_", " ")}</Text>
                   </View>
                   <Text style={styles.reportSummary} numberOfLines={4}>
-                    {stored.report.summary.oneLiner}
+                    {stored.report.summary.headline}
                   </Text>
                 </Pressable>
               </StaggeredFadeIn>
@@ -55,8 +56,8 @@ export default function PreviousReportsScreen() {
         </StaggeredFadeIn>
       ) : (
         <StaggeredFadeIn index={1}>
-          <SectionCard eyebrow="Saved reports" title="No previous reports yet">
-            <Text style={styles.emptyBody}>Your completed consultation notes will appear here once they are saved.</Text>
+          <SectionCard eyebrow="Saved analyses" title="No previous lab analyses yet">
+            <Text style={styles.emptyBody}>Completed lab analyses will appear here once they are saved.</Text>
           </SectionCard>
         </StaggeredFadeIn>
       )}
@@ -107,12 +108,13 @@ const styles = StyleSheet.create({
   },
   reportPillPressed: {
     transform: [{ scale: 0.992 }],
-    borderColor: "#ffd3ea",
+    borderColor: "#a9d6ee",
   },
   reportMetaRow: {
     flexDirection: "row",
     gap: spacing.xs,
     alignItems: "center",
+    flexWrap: "wrap",
   },
   reportMeta: {
     ...typography.semibold,

@@ -20,5 +20,5 @@ export default function HistoricalReportScreen() {
     return null;
   }
 
-  return <ReportDetailScreen storedReport={storedReport} onBack={() => router.replace("/reports")} backLabel="Back" />;
+  return <ReportDetailScreen storedReport={storedReport} onBack={() => router.replace("/reports")} backLabel="Reports" />;
 }

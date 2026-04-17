@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Image, LayoutChangeEvent, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { colors, radius, spacing, typography } from "@/constants/theme";
+import { getTemplateContentOption } from "@/lib/templateLayout";
 import { TemplateRegion, PdfTemplate } from "@/types/template";
 
 type TemplateRegionEditorProps = {
@@ -89,12 +90,17 @@ function DraggableRegion({
     });
   }, [containerHeight, containerWidth, onMoveRegion, onSelectRegion, region.height, region.id, region.width, region.x, region.y]);
 
+  const risk = region.diagnostics?.overflowRisk ?? "low";
+  const contentOption = getTemplateContentOption(region.contentKey);
+
   return (
     <Pressable
       onPress={() => onSelectRegion(region.id)}
       style={[
         styles.region,
         selected ? styles.regionSelected : styles.regionIdle,
+        !selected && risk === "medium" && styles.regionMedium,
+        !selected && risk === "high" && styles.regionHigh,
         {
           left: `${region.x * 100}%`,
           top: `${region.y * 100}%`,
@@ -105,6 +111,9 @@ function DraggableRegion({
       {...responder.panHandlers}
     >
       <Text style={[styles.regionLabel, selected && styles.regionLabelSelected]}>{region.label}</Text>
+      <Text style={[styles.regionHint, selected && styles.regionHintSelected]} numberOfLines={2}>
+        {contentOption.label}
+      </Text>
     </Pressable>
   );
 }
@@ -149,12 +158,31 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: colors.accent,
   },
+  regionMedium: {
+    backgroundColor: "rgba(255, 210, 120, 0.2)",
+    borderWidth: 1,
+    borderColor: "rgba(152, 98, 0, 0.55)",
+  },
+  regionHigh: {
+    backgroundColor: "rgba(255, 120, 90, 0.18)",
+    borderWidth: 1,
+    borderColor: "rgba(196, 59, 24, 0.65)",
+  },
   regionLabel: {
     ...typography.semibold,
     fontSize: 11,
     color: colors.ink,
   },
   regionLabelSelected: {
+    color: colors.accent,
+  },
+  regionHint: {
+    ...typography.medium,
+    marginTop: 2,
+    fontSize: 10,
+    color: colors.textSoft,
+  },
+  regionHintSelected: {
     color: colors.accent,
   },
 });

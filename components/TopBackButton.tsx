@@ -3,23 +3,15 @@ import { Pressable, StyleProp, StyleSheet, Text, ViewStyle } from "react-native"
 import { colors, radius, spacing, typography } from "@/constants/theme";
 import { triggerPressHapticAsync } from "@/lib/haptics";
 
-type PrimaryButtonProps = {
-  label: string;
+type TopBackButtonProps = {
   onPress: () => void | Promise<void>;
-  secondary?: boolean;
+  label?: string;
   disabled?: boolean;
   haptics?: boolean;
   style?: StyleProp<ViewStyle>;
 };
 
-export function PrimaryButton({
-  label,
-  onPress,
-  secondary = false,
-  disabled = false,
-  haptics = true,
-  style,
-}: PrimaryButtonProps) {
+export function TopBackButton({ onPress, label = "Back", disabled = false, haptics = true, style }: TopBackButtonProps) {
   function handlePress() {
     if (disabled) {
       return;
@@ -36,52 +28,50 @@ export function PrimaryButton({
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ disabled }}
-      android_ripple={{ color: secondary ? "rgba(20,20,43,0.08)" : "rgba(255,255,255,0.16)" }}
+      android_ripple={{ color: "rgba(20,20,43,0.08)" }}
       disabled={disabled}
       onPress={handlePress}
       style={({ pressed }) => [
-        styles.base,
-        secondary ? styles.secondary : styles.primary,
+        styles.button,
         disabled && styles.disabled,
         pressed && !disabled && styles.pressed,
         style,
       ]}
     >
-      <Text style={[styles.label, secondary ? styles.secondaryLabel : styles.primaryLabel]}>{label}</Text>
+      <Text style={styles.arrow}>&lt;</Text>
+      <Text style={styles.label}>{label}</Text>
     </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
-  base: {
-    borderRadius: radius.pill,
-    paddingHorizontal: spacing.xl,
-    paddingVertical: spacing.md,
+  button: {
+    alignSelf: "flex-start",
+    minHeight: 42,
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-  },
-  primary: {
-    backgroundColor: colors.ink,
-  },
-  secondary: {
-    backgroundColor: colors.white,
+    gap: spacing.xs,
+    borderRadius: radius.pill,
     borderWidth: 1,
     borderColor: colors.border,
-  },
-  disabled: {
-    opacity: 0.55,
+    backgroundColor: colors.white,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
   },
   pressed: {
     transform: [{ scale: 0.99 }],
   },
-  label: {
+  disabled: {
+    opacity: 0.55,
+  },
+  arrow: {
     ...typography.semibold,
     fontSize: 16,
+    color: colors.ink,
   },
-  primaryLabel: {
-    color: colors.white,
-  },
-  secondaryLabel: {
+  label: {
+    ...typography.semibold,
+    fontSize: 14,
     color: colors.ink,
   },
 });

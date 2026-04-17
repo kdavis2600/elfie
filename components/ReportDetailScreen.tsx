@@ -18,12 +18,13 @@ import { AppScreen } from "@/components/AppScreen";
 import { PrimaryButton } from "@/components/PrimaryButton";
 import { SectionCard } from "@/components/SectionCard";
 import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
+import { TopBackButton } from "@/components/TopBackButton";
 import { colors, radius, spacing, typography } from "@/constants/theme";
 import { editReportWithAiAsync } from "@/lib/api";
 import { generateReportPdfAsync } from "@/lib/pdf";
 import { useSession } from "@/lib/session";
 import { persistPdfAsync } from "@/lib/storage";
-import { normalizeTranscriptSegments } from "@/lib/transcript";
+import { normalizeConsultationReport, normalizeTranscriptSegments } from "@/lib/transcript";
 import { ConsultationReport, StoredReport, TranscriptSegment } from "@/types/report";
 
 type ReportDetailScreenProps = {
@@ -50,7 +51,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
   const [aiInstruction, setAiInstruction] = useState("");
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [shareAvailable, setShareAvailable] = useState(true);
-  const report = storedReport.report;
+  const report = useMemo(() => normalizeConsultationReport(storedReport.report), [storedReport.report]);
   const pdfUri = storedReport.pdfUri ?? null;
   const activeEditor = activeEditorId ? EDITOR_DEFINITIONS[activeEditorId] ?? null : null;
 
@@ -83,8 +84,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
   }, []);
 
   const rtl = isRtlLanguage(report.language.detected) || I18nManager.isRTL;
-  const privacyMode = report.privacy?.mode === "redacted";
-  const transcriptTitle = privacyMode ? "Redacted transcript" : "Transcript";
+  const transcriptTitle = "Transcript";
   const transcriptSegments = useMemo(
     () => normalizeTranscriptSegments(report.transcript.fullText, report.transcript.segments),
     [report.transcript.fullText, report.transcript.segments],
@@ -191,23 +191,26 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
   return (
     <AppScreen scroll contentContainerStyle={styles.content}>
       <StaggeredFadeIn index={0} resetKey={report.id}>
-        <SectionCard eyebrow="Consultation report" title={report.summary.oneLiner}>
-          <Text style={styles.meta}>
-            {new Date(report.createdAt).toLocaleString()} · {report.language.detected.toUpperCase()}
-          </Text>
-          <Text style={styles.guidance}>
-            Tap any note section below to rewrite it. The keyboard supports typing and dictation.
-          </Text>
-          <View style={styles.headerActions}>
-            <PrimaryButton label="Edit With AI" onPress={() => setAiModalVisible(true)} disabled={isBusy} />
-          </View>
-          {busyMessage ? (
-            <View style={styles.busyRow}>
-              <ActivityIndicator color={colors.accent} />
-              <Text style={styles.busyText}>{busyMessage}</Text>
+        <View style={styles.headerStack}>
+          <TopBackButton label={backLabel} onPress={onBack} disabled={isBusy} />
+          <SectionCard eyebrow="Consultation report" title={report.summary.oneLiner}>
+            <Text style={styles.meta}>
+              {new Date(report.createdAt).toLocaleString()} · {report.language.detected.toUpperCase()}
+            </Text>
+            <Text style={styles.guidance}>
+              Tap any note section below to rewrite it. The keyboard supports typing and dictation.
+            </Text>
+            <View style={styles.headerActions}>
+              <PrimaryButton label="Edit With AI" onPress={() => setAiModalVisible(true)} disabled={isBusy} />
             </View>
-          ) : null}
-        </SectionCard>
+            {busyMessage ? (
+              <View style={styles.busyRow}>
+                <ActivityIndicator color={colors.accent} />
+                <Text style={styles.busyText}>{busyMessage}</Text>
+              </View>
+            ) : null}
+          </SectionCard>
+        </View>
       </StaggeredFadeIn>
 
       <StaggeredFadeIn index={1} resetKey={report.id}>
@@ -235,18 +238,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
 
       {activeTab === "report" ? (
         <>
-          {privacyMode ? (
-            <StaggeredFadeIn index={2} resetKey={report.id}>
-                <SectionCard eyebrow="Privacy mode" title="Identifiers removed before note extraction">
-                  <Text style={styles.body}>
-                    Direct identifiers are redacted where possible before structured extraction. The saved transcript is
-                    redacted, and PDF export omits the full transcript to reduce accidental sharing.
-                  </Text>
-                </SectionCard>
-            </StaggeredFadeIn>
-          ) : null}
-
-          <StaggeredFadeIn index={privacyMode ? 3 : 2} resetKey={report.id}>
+          <StaggeredFadeIn index={2} resetKey={report.id}>
               <SectionCard eyebrow="Summary" title="Summary">
                 <EditableBlock
                   label="Headline"
@@ -263,7 +255,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
               </SectionCard>
           </StaggeredFadeIn>
 
-          <StaggeredFadeIn index={privacyMode ? 4 : 3} resetKey={report.id}>
+          <StaggeredFadeIn index={3} resetKey={report.id}>
               <SectionCard eyebrow="Visit" title={report.visit.visitReason}>
                 <Text style={styles.meta}>Type: {formatVisitType(report.visit.visitType)}</Text>
                 <EditableBlock
@@ -275,7 +267,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
               </SectionCard>
           </StaggeredFadeIn>
 
-          <StaggeredFadeIn index={privacyMode ? 5 : 4} resetKey={report.id}>
+          <StaggeredFadeIn index={4} resetKey={report.id}>
               <SectionCard title="Subjective">
                 <EditableBlock
                   label="Chief complaint"
@@ -322,7 +314,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
               </SectionCard>
           </StaggeredFadeIn>
 
-          <StaggeredFadeIn index={privacyMode ? 6 : 5} resetKey={report.id}>
+          <StaggeredFadeIn index={5} resetKey={report.id}>
               <SectionCard title="Objective">
                 <EditableBlock
                   label="Vitals"
@@ -351,7 +343,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
               </SectionCard>
           </StaggeredFadeIn>
 
-          <StaggeredFadeIn index={privacyMode ? 7 : 6} resetKey={report.id}>
+          <StaggeredFadeIn index={6} resetKey={report.id}>
               <SectionCard title="Assessment">
                 <EditableBlock
                   label="Assessment summary"
@@ -380,7 +372,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
               </SectionCard>
           </StaggeredFadeIn>
 
-          <StaggeredFadeIn index={privacyMode ? 8 : 7} resetKey={report.id}>
+          <StaggeredFadeIn index={7} resetKey={report.id}>
               <SectionCard title="Plan">
                 <EditableBlock
                   label="Medications"
@@ -427,7 +419,7 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
               </SectionCard>
           </StaggeredFadeIn>
 
-          <StaggeredFadeIn index={privacyMode ? 9 : 8} resetKey={report.id}>
+          <StaggeredFadeIn index={8} resetKey={report.id}>
               <SectionCard title="Quality review">
                 <EditableBlock
                   label="Missing information"
@@ -465,7 +457,6 @@ export function ReportDetailScreen({ storedReport, onBack, backLabel = "Back" }:
       <StaggeredFadeIn index={10} resetKey={report.id}>
         <View style={styles.actions}>
           <PrimaryButton label="Share PDF" onPress={handleShare} disabled={!pdfUri || isBusy || !shareAvailable} />
-          <PrimaryButton label={backLabel} onPress={onBack} secondary disabled={isBusy} />
         </View>
       </StaggeredFadeIn>
 
@@ -974,6 +965,9 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.xxxl,
     gap: spacing.lg,
   },
+  headerStack: {
+    gap: spacing.md,
+  },
   meta: {
     ...typography.medium,
     color: colors.textSoft,
@@ -1014,7 +1008,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.white,
     borderWidth: 1,
     borderColor: colors.border,
+    minHeight: 54,
     alignItems: "center",
+    justifyContent: "center",
   },
   tabActive: {
     backgroundColor: "#fff4fa",
@@ -1027,6 +1023,7 @@ const styles = StyleSheet.create({
     ...typography.semibold,
     fontSize: 14,
     color: colors.ink,
+    textAlign: "center",
   },
   tabLabelActive: {
     color: colors.accent,

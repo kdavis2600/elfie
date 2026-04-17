@@ -10,25 +10,33 @@ import cors from "cors";
 import express from "express";
 import mime from "mime-types";
 import multer from "multer";
-import { createCanvas } from "@napi-rs/canvas";
+import { createCanvas, loadImage } from "@napi-rs/canvas";
 
 import { createMockReport } from "../../lib/mock";
-import { normalizeTranscriptSegments } from "../../lib/transcript";
+import { cleanPrivacyRedactionText, normalizeTranscriptSegments } from "../../lib/transcript";
+import { PendingLabDocument } from "../../types/labReport";
 import { ConsultationReport, PendingAudio } from "../../types/report";
+import { analyzeLabDocumentAsync, LAB_UPLOAD_LIMIT_BYTES } from "./labAnalyzer";
+import { labAnalysisReportSchema } from "./labReportSchema";
 import { consultationReportSchema } from "./reportSchema";
 
 const app = express();
 const AUDIO_UPLOAD_DIR = path.join(os.tmpdir(), "elfie-audio-uploads");
+const LAB_UPLOAD_DIR = path.join(os.tmpdir(), "elfie-lab-uploads");
 mkdirSync(AUDIO_UPLOAD_DIR, { recursive: true });
+mkdirSync(LAB_UPLOAD_DIR, { recursive: true });
 
 const audioUpload = multer({ dest: AUDIO_UPLOAD_DIR, limits: { fileSize: 25 * 1024 * 1024 } });
+const labUpload = multer({ dest: LAB_UPLOAD_DIR, limits: { fileSize: LAB_UPLOAD_LIMIT_BYTES } });
 const templateUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const SUPPORTED_LAB_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
 
 const PORT = Number(process.env.PORT ?? 8787);
 const RAW_BASE_URL =
   process.env.QWEN_BASE_URL ?? "https://dashscope-intl.aliyuncs.com/api/v2/apps/protocols/compatible-mode/v1";
 const QWEN_MODEL = process.env.QWEN_MODEL ?? "qwen3.5-plus";
 const QWEN_REPAIR_MODEL = process.env.QWEN_REPAIR_MODEL ?? "qwen-flash";
+const QWEN_TEMPLATE_VISION_MODEL = process.env.QWEN_TEMPLATE_VISION_MODEL ?? "qwen-vl-max-latest";
 const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY;
 const PRIVACY_MODE = parseBoolean(process.env.PRIVACY_MODE, true);
 const ASR_CHUNK_CONCURRENCY = clampInteger(parseNullableNumber(process.env.ASR_CHUNK_CONCURRENCY), 1, 3) ?? 3;
@@ -151,6 +159,64 @@ app.post("/api/edit-report", async (req, res) => {
   }
 });
 
+app.post("/api/analyze-lab-report", labUpload.single("file"), async (req, res) => {
+  const startedAt = Date.now();
+  const file = req.file;
+  const sourceType = parseLabSourceType(req.body?.sourceType);
+  const sizeBytes = parseNullableNumber(req.body?.sizeBytes) ?? file?.size ?? null;
+
+  if (!file) {
+    res.status(400).send("Missing lab document file.");
+    return;
+  }
+
+  const mimeType = file.mimetype || mime.lookup(file.originalname) || "application/octet-stream";
+
+  if (!isSupportedLabDocumentMimeType(String(mimeType))) {
+    res.status(400).send("Lab analysis supports PDF, JPG, PNG, WEBP, and HEIC/HEIF uploads only.");
+    return;
+  }
+
+  try {
+    const pendingDocument: PendingLabDocument = {
+      uri: file.originalname,
+      fileName: file.originalname,
+      mimeType: String(mimeType),
+      sizeBytes,
+      sourceType,
+    };
+
+    const report = labAnalysisReportSchema.parse(await analyzeLabDocumentAsync(file.path, pendingDocument));
+
+    logRun(report.processing.usedMock ? "mock" : "success", startedAt, {
+      scope: "elfie-analyze-labs",
+      sourceType,
+      processingMode: report.processing.mode,
+      resultCount: report.results.length,
+      pageCount: report.sourceDocument.pageCount ?? null,
+    });
+
+    res.json({
+      report,
+      usedMock: report.processing.usedMock,
+      processingMode: report.processing.mode,
+    });
+  } catch (error) {
+    console.error("[analyze-lab-report] failed", error);
+    logRun("failure", startedAt, {
+      scope: "elfie-analyze-labs",
+      sourceType,
+      error: error instanceof Error ? error.message : "unknown",
+    });
+    const message = error instanceof Error ? error.message : "Lab analysis failed.";
+    res.status(resolveServerErrorStatus(error)).send(message);
+  } finally {
+    if (file?.path) {
+      await fs.rm(file.path, { force: true });
+    }
+  }
+});
+
 app.post("/api/template-preview", templateUpload.single("file"), async (req, res) => {
   const file = req.file;
 
@@ -177,10 +243,46 @@ app.post("/api/template-preview", templateUpload.single("file"), async (req, res
   }
 });
 
+app.post("/api/template-sanity-check", async (req, res) => {
+  const previewBase64 = typeof req.body?.previewBase64 === "string" ? req.body.previewBase64.trim() : "";
+  const previewMimeType = typeof req.body?.previewMimeType === "string" ? req.body.previewMimeType.trim() : "image/png";
+  const pageWidth = parseNullableNumber(req.body?.pageWidth);
+  const pageHeight = parseNullableNumber(req.body?.pageHeight);
+  const regions = Array.isArray(req.body?.regions) ? req.body.regions : [];
+
+  if (!previewBase64 || !pageWidth || !pageHeight || !regions.length) {
+    res.status(400).send("Missing template sanity-check payload.");
+    return;
+  }
+
+  if (!DASHSCOPE_API_KEY) {
+    res.status(503).send("AI spot-check is unavailable because the Qwen API key is not configured.");
+    return;
+  }
+
+  try {
+    const overlayBuffer = await renderTemplateSpotCheckImageAsync({
+      previewBase64,
+      previewMimeType,
+      pageWidth,
+      pageHeight,
+      regions,
+    });
+    const aiPayload = await analyzeTemplateSpotCheckAsync(overlayBuffer, previewMimeType, regions);
+    res.json(mergeTemplateSpotCheckResult(aiPayload, regions));
+  } catch (error) {
+    console.error("[template-sanity-check] failed", error);
+    const message = error instanceof Error ? error.message : "Template sanity check failed.";
+    res.status(resolveServerErrorStatus(error)).send(message);
+  }
+});
+
 app.use((error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (error instanceof multer.MulterError) {
     if (error.code === "LIMIT_FILE_SIZE") {
-      res.status(400).send("Uploaded file is too large. Keep files under 25 MB.");
+      res
+        .status(400)
+        .send("Uploaded file is too large. Keep audio/template files under 25 MB and lab documents under 15 MB.");
       return;
     }
 
@@ -269,7 +371,7 @@ async function extractReportAsync({
     "Populate transcript.segments with short speaker turns whenever possible.",
     "Infer likely doctor and patient turns from the consultation context. Use unknown only when the speaker truly cannot be inferred.",
     privacyMode
-      ? "Privacy mode is enabled. Direct identifiers may already be replaced with [redacted ...] placeholders. Never restore, infer, or fabricate them."
+      ? "Privacy mode is enabled. Direct identifiers may already be removed or replaced with generic role labels or placeholders. Never restore, infer, or fabricate them."
       : "If names are genuinely present in the transcript, you may include them.",
     privacyMode ? "Set visit.patientName and visit.clinicianName to null." : "Use null for names when they are missing.",
     "",
@@ -832,10 +934,7 @@ function mergeEditedReport(input: unknown, originalReport: ConsultationReport): 
 }
 
 function redactSensitiveText(value: string) {
-  return applyRedactionRules(value)
-    .replace(/\s{2,}/g, " ")
-    .replace(/\s+([,.;:!?])/g, "$1")
-    .trim();
+  return cleanPrivacyRedactionText(applyRedactionRules(value));
 }
 
 function applyRedactionRules(value: string) {
@@ -868,11 +967,11 @@ function applyRedactionRules(value: string) {
     ],
     [
       new RegExp(`\\b(${namePrefixPattern})\\s+(${fullNamePattern})`, "giu"),
-      (_match, prefix) => `${prefix} [redacted name]`,
+      (_match, prefix) => replaceNamedPrefix(prefix),
     ],
     [
       new RegExp(`\\b(${roleNamePattern})\\s*[:,-]?\\s*(${fullNamePattern})`, "giu"),
-      (_match, prefix) => `${prefix} [redacted name]`,
+      (_match, prefix) => String(prefix).trim(),
     ],
   ];
 
@@ -880,6 +979,47 @@ function applyRedactionRules(value: string) {
     (currentValue, [pattern, replacement]) => currentValue.replace(pattern, replacement as never),
     value,
   );
+}
+
+function replaceNamedPrefix(prefix: string) {
+  const normalized = prefix.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim();
+
+  if (
+    normalized === "my name is" ||
+    normalized === "name is" ||
+    normalized === "this is" ||
+    normalized === "tên tôi là" ||
+    normalized === "em tên là" ||
+    normalized === "tôi tên là"
+  ) {
+    return "";
+  }
+
+  if (normalized === "mr" || normalized === "mrs" || normalized === "ms" || normalized === "patient name is") {
+    return preserveReplacementCase(prefix, "patient");
+  }
+
+  if (normalized === "doctor name is" || normalized === "clinician name is") {
+    return preserveReplacementCase(prefix, "doctor");
+  }
+
+  return String(prefix).trim();
+}
+
+function preserveReplacementCase(sample: string, replacement: string) {
+  if (!sample) {
+    return replacement;
+  }
+
+  if (sample === sample.toUpperCase()) {
+    return replacement.toUpperCase();
+  }
+
+  if (/^\p{Lu}/u.test(sample)) {
+    return `${replacement[0]?.toUpperCase() ?? ""}${replacement.slice(1)}`;
+  }
+
+  return replacement;
 }
 
 function dedupeStrings(values: string[]) {
@@ -949,6 +1089,14 @@ function parseSourceType(value: unknown): PendingAudio["sourceType"] {
   return value === "recorded" || value === "sample" || value === "imported" ? value : "sample";
 }
 
+function parseLabSourceType(value: unknown): PendingLabDocument["sourceType"] {
+  return value === "sample" || value === "pdf" || value === "image" ? value : "pdf";
+}
+
+function isSupportedLabDocumentMimeType(mimeType: string) {
+  return mimeType.includes("pdf") || SUPPORTED_LAB_IMAGE_MIME_TYPES.has(mimeType.toLowerCase());
+}
+
 function parseBoolean(value: unknown, defaultValue = false) {
   if (value == null || value === "") {
     return defaultValue;
@@ -968,6 +1116,10 @@ function parseBoolean(value: unknown, defaultValue = false) {
 }
 
 function parseNullableNumber(value: unknown) {
+  if (value == null || value === "") {
+    return null;
+  }
+
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -1091,6 +1243,305 @@ async function renderPdfPreviewAsync(buffer: Buffer) {
     width: Math.ceil(viewport.width),
     height: Math.ceil(viewport.height),
   };
+}
+
+type TemplateSpotCheckRegionInput = {
+  id: string;
+  label: string;
+  contentKey: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  title: string;
+  lines: string[];
+  fontSize: number;
+  lineHeight: number;
+  backgroundOpacity: number;
+  overflowRisk: "low" | "medium" | "high";
+};
+
+async function renderTemplateSpotCheckImageAsync(input: {
+  previewBase64: string;
+  previewMimeType: string;
+  pageWidth: number;
+  pageHeight: number;
+  regions: unknown[];
+}) {
+  const width = clampInteger(Math.round(input.pageWidth), 320, 2200) ?? 816;
+  const height = clampInteger(Math.round(input.pageHeight), 320, 3000) ?? 1056;
+  const previewBuffer = Buffer.from(input.previewBase64, "base64");
+  const previewImage = await loadImage(previewBuffer);
+  const regions = input.regions
+    .map(normalizeTemplateSpotCheckRegion)
+    .filter((region): region is TemplateSpotCheckRegionInput => Boolean(region));
+  const canvas = createCanvas(width, height);
+  const context = canvas.getContext("2d");
+
+  context.drawImage(previewImage, 0, 0, width, height);
+
+  for (const region of regions) {
+    const left = Math.round(region.x * width);
+    const top = Math.round(region.y * height);
+    const regionWidth = Math.round(region.width * width);
+    const regionHeight = Math.round(region.height * height);
+    const paddingX = 10;
+    const paddingY = 8;
+    const riskColor =
+      region.overflowRisk === "high"
+        ? "rgba(191, 38, 0, 0.7)"
+        : region.overflowRisk === "medium"
+          ? "rgba(153, 102, 0, 0.65)"
+          : "rgba(20, 20, 43, 0.16)";
+
+    context.save();
+    context.beginPath();
+    context.rect(left, top, regionWidth, regionHeight);
+    context.clip();
+    context.fillStyle = `rgba(255, 255, 255, ${Math.min(1, Math.max(0.2, region.backgroundOpacity))})`;
+    context.fillRect(left, top, regionWidth, regionHeight);
+    context.strokeStyle = riskColor;
+    context.lineWidth = region.overflowRisk === "high" ? 2 : 1;
+    context.strokeRect(left, top, regionWidth, regionHeight);
+
+    let cursorY = top + paddingY + 10;
+
+    if (region.title) {
+      context.font = "700 9px sans-serif";
+      context.fillStyle = "#776e91";
+      context.fillText(region.title.toUpperCase(), left + paddingX, cursorY);
+      cursorY += 14;
+    }
+
+    context.font = `600 ${Math.max(8, Math.round(region.fontSize))}px sans-serif`;
+    context.fillStyle = "#14142b";
+
+    region.lines.slice(0, 8).forEach((line, index) => {
+      if (index > 0) {
+        context.font = `${Math.max(8, Math.round(region.fontSize))}px sans-serif`;
+        context.fillStyle = "#4e4b66";
+      }
+
+      context.fillText(line, left + paddingX, cursorY);
+      cursorY += Math.max(12, region.lineHeight);
+    });
+
+    context.restore();
+  }
+
+  return canvas.encode("png");
+}
+
+async function analyzeTemplateSpotCheckAsync(
+  overlayBuffer: Buffer,
+  _previewMimeType: string,
+  regions: unknown[],
+) {
+  const normalizedRegions = regions
+    .map(normalizeTemplateSpotCheckRegion)
+    .filter((region): region is TemplateSpotCheckRegionInput => Boolean(region));
+  const prompt = [
+    "Return JSON only.",
+    "You are reviewing a clinical form overlay for layout QA only.",
+    "Do not comment on medical correctness. Focus only on presentation issues such as clipped text, text outside boxes, unreadably dense fields, or labels that make the form look messy.",
+    "If the form looks acceptable, say so briefly.",
+    "Required JSON shape:",
+    JSON.stringify(
+      {
+        overallRisk: "low|medium|high",
+        summary: "string",
+        suggestions: ["string"],
+        regionFindings: [{ regionId: "string", overflowRisk: "low|medium|high", note: "string" }],
+      },
+      null,
+      2,
+    ),
+    "",
+    `Region metadata:\n${JSON.stringify(
+      normalizedRegions.map((region) => ({
+        regionId: region.id,
+        label: region.label,
+        contentKey: region.contentKey,
+        heuristicRisk: region.overflowRisk,
+      })),
+      null,
+      2,
+    )}`,
+  ].join("\n");
+
+  const response = await qwenChatCompletionAsync({
+    model: QWEN_TEMPLATE_VISION_MODEL,
+    messages: [
+      {
+        role: "system",
+        content: "You are a meticulous document layout reviewer. Output JSON only.",
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: prompt,
+          },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:image/png;base64,${overlayBuffer.toString("base64")}`,
+            },
+          },
+        ],
+      },
+    ],
+    response_format: {
+      type: "json_object",
+    },
+    enable_thinking: false,
+  });
+
+  const parsed = parseJsonLike(extractMessageText(response));
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Template spot-check did not return valid JSON.");
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+function mergeTemplateSpotCheckResult(aiPayload: Record<string, unknown>, rawRegions: unknown[]) {
+  const normalizedRegions = rawRegions
+    .map(normalizeTemplateSpotCheckRegion)
+    .filter((region): region is TemplateSpotCheckRegionInput => Boolean(region));
+  const aiRegionFindings = new Map(
+    (Array.isArray(aiPayload.regionFindings) ? aiPayload.regionFindings : [])
+      .map((value) => normalizeAiRegionFinding(value))
+      .filter((finding): finding is NonNullable<ReturnType<typeof normalizeAiRegionFinding>> => Boolean(finding))
+      .map((finding) => [finding.regionId, finding]),
+  );
+
+  const regionFindings: Array<{
+    regionId: string;
+    contentKey: string;
+    overflowRisk: "low" | "medium" | "high";
+    note: string;
+  }> = normalizedRegions.map((region) => {
+    const aiFinding = aiRegionFindings.get(region.id);
+    return {
+      regionId: region.id,
+      contentKey: region.contentKey,
+      overflowRisk: maxTemplateRisk(region.overflowRisk, aiFinding?.overflowRisk ?? "low"),
+      note:
+        aiFinding?.note ??
+        (region.overflowRisk === "high"
+          ? "This field is likely too tight for the mapped content."
+          : region.overflowRisk === "medium"
+            ? "This field looks usable but dense."
+            : "This field appears visually stable."),
+    };
+  });
+
+  const overallRisk = regionFindings.reduce<"low" | "medium" | "high">(
+    (current, finding) => maxTemplateRisk(current, finding.overflowRisk),
+    normalizeTemplateRisk(aiPayload.overallRisk, "low"),
+  );
+  const suggestions = dedupeStrings(
+    [
+      ...readStringArray(aiPayload.suggestions, []),
+      ...normalizedRegions
+        .filter((region) => region.overflowRisk !== "low")
+        .map((region) =>
+          region.overflowRisk === "high"
+            ? `${region.label} should be taller or mapped to a shorter content block.`
+            : `${region.label} would read better with a bit more room.`,
+        ),
+    ].slice(0, 6),
+  );
+
+  return {
+    checkedAt: new Date().toISOString(),
+    checker: "ai",
+    overallRisk,
+    summary:
+      (typeof aiPayload.summary === "string" && aiPayload.summary.trim()) || buildTemplateSpotCheckSummary(overallRisk),
+    suggestions,
+    regionFindings,
+  };
+}
+
+function normalizeTemplateSpotCheckRegion(value: unknown): TemplateSpotCheckRegionInput | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const region = value as Record<string, unknown>;
+  const id = typeof region.id === "string" ? region.id : "";
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    label: typeof region.label === "string" ? region.label : id,
+    contentKey: typeof region.contentKey === "string" ? region.contentKey : "visit_summary",
+    x: clampTemplateCoordinate(region.x, 0),
+    y: clampTemplateCoordinate(region.y, 0),
+    width: clampTemplateCoordinate(region.width, 0.2),
+    height: clampTemplateCoordinate(region.height, 0.12),
+    title: typeof region.title === "string" ? region.title : "",
+    lines: Array.isArray(region.lines) ? region.lines.filter((line): line is string => typeof line === "string").slice(0, 10) : [],
+    fontSize: typeof region.fontSize === "number" && Number.isFinite(region.fontSize) ? region.fontSize : 11,
+    lineHeight: typeof region.lineHeight === "number" && Number.isFinite(region.lineHeight) ? region.lineHeight : 14,
+    backgroundOpacity:
+      typeof region.backgroundOpacity === "number" && Number.isFinite(region.backgroundOpacity)
+        ? region.backgroundOpacity
+        : 0.82,
+    overflowRisk: normalizeTemplateRisk(region.overflowRisk, "low"),
+  };
+}
+
+function normalizeAiRegionFinding(value: unknown) {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const finding = value as Record<string, unknown>;
+  const regionId = typeof finding.regionId === "string" ? finding.regionId : "";
+  if (!regionId) {
+    return null;
+  }
+
+  return {
+    regionId,
+    overflowRisk: normalizeTemplateRisk(finding.overflowRisk, "low"),
+    note: typeof finding.note === "string" && finding.note.trim() ? finding.note.trim() : null,
+  };
+}
+
+function normalizeTemplateRisk(value: unknown, fallback: "low" | "medium" | "high") {
+  return value === "low" || value === "medium" || value === "high" ? value : fallback;
+}
+
+function maxTemplateRisk(left: "low" | "medium" | "high", right: "low" | "medium" | "high") {
+  if (left === "high" || right === "high") {
+    return "high";
+  }
+  if (left === "medium" || right === "medium") {
+    return "medium";
+  }
+  return "low";
+}
+
+function buildTemplateSpotCheckSummary(overallRisk: "low" | "medium" | "high") {
+  switch (overallRisk) {
+    case "high":
+      return "At least one overlay field still looks too tight or visually awkward.";
+    case "medium":
+      return "The form looks mostly usable, but a couple of fields are visually dense.";
+    default:
+      return "The form overlay looks stable and readable.";
+  }
+}
+
+function clampTemplateCoordinate(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
 }
 
 async function mapWithConcurrencyLimit<TInput, TOutput>(

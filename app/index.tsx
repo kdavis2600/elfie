@@ -1,6 +1,4 @@
-import { Asset } from "expo-asset";
 import { useEventListener } from "expo";
-import * as Haptics from "expo-haptics";
 import { useVideoPlayer, VideoView } from "expo-video";
 import { router, useFocusEffect } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -11,24 +9,27 @@ import {
   Image,
   Pressable,
   Platform,
-  ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from "react-native";
 
 import { BrandBackground } from "@/components/BrandBackground";
 import { PrimaryButton } from "@/components/PrimaryButton";
+import { ScrollReveal } from "@/components/ScrollReveal";
 import { SectionCard } from "@/components/SectionCard";
 import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
 import { colors, radius, spacing, typography } from "@/constants/theme";
-import { UI_PRIVACY_MODE_ENABLED } from "@/lib/privacy";
+import { triggerPressHapticAsync } from "@/lib/haptics";
 import { useSession } from "@/lib/session";
 
 let hasSeenIntroThisLaunch = false;
+const SKIP_INTRO_VISIBLE_MS = 5000;
 
 export default function HomeScreen() {
-  const { currentTemplate, isHydrated, storedReports, setPendingAudio } = useSession();
+  const { currentTemplate, isHydrated, storedLabReports, storedReports } = useSession();
+  const { height: viewportHeight } = useWindowDimensions();
   const [introReady, setIntroReady] = useState(false);
   const [introFinished, setIntroFinished] = useState(false);
   const [introDismissed, setIntroDismissed] = useState(hasSeenIntroThisLaunch || Platform.OS === "web");
@@ -37,10 +38,11 @@ export default function HomeScreen() {
   const introFade = useRef(new Animated.Value(1)).current;
   const blackOverlay = useRef(new Animated.Value(0)).current;
   const contentFade = useRef(new Animated.Value(0)).current;
+  const scrollY = useRef(new Animated.Value(0)).current;
   const dismissingRef = useRef(false);
   const player = useVideoPlayer(require("../assets/video/intro-optimized.mp4"), (videoPlayer) => {
     videoPlayer.loop = false;
-    videoPlayer.muted = false;
+    videoPlayer.muted = true;
     videoPlayer.timeUpdateEventInterval = 0.1;
     videoPlayer.play();
   });
@@ -68,17 +70,19 @@ export default function HomeScreen() {
   }, [contentFade, introDismissed]);
 
   useEffect(() => {
-    if (introDismissed) {
+    if (introDismissed || introFinished) {
       setSkipVisible(false);
       return;
     }
 
+    setSkipVisible(true);
+
     const timer = setTimeout(() => {
-      setSkipVisible(true);
-    }, 900);
+      setSkipVisible(false);
+    }, SKIP_INTRO_VISIBLE_MS);
 
     return () => clearTimeout(timer);
-  }, [introDismissed]);
+  }, [introDismissed, introFinished]);
 
   useEventListener(player, "playToEnd", () => {
     player.pause();
@@ -87,32 +91,6 @@ export default function HomeScreen() {
     }
     setIntroFinished(true);
   });
-
-  async function handleSamplePress() {
-    if (navBusy) {
-      return;
-    }
-
-    try {
-      setNavBusy(true);
-      await Haptics.selectionAsync();
-      const asset = Asset.fromModule(require("../assets/audio/sample-consultation-short.mp3"));
-      await asset.downloadAsync();
-      const uri = asset.localUri ?? asset.uri;
-
-      setPendingAudio({
-        uri,
-        fileName: "sample-consultation-short.mp3",
-        durationSec: 90,
-        mimeType: "audio/mpeg",
-        sourceType: "sample",
-      });
-      router.push("/processing");
-    } catch (error) {
-      console.error(error);
-      setNavBusy(false);
-    }
-  }
 
   function navigateTo(path: Parameters<typeof router.push>[0]) {
     if (navBusy) {
@@ -129,6 +107,7 @@ export default function HomeScreen() {
     }
 
     dismissingRef.current = true;
+    void triggerPressHapticAsync();
     player.pause();
 
     Animated.parallel([
@@ -167,77 +146,76 @@ export default function HomeScreen() {
     <View style={styles.screen}>
       <Animated.View style={[styles.homeLayer, { opacity: contentFade }]}>
         <BrandBackground>
-          <ScrollView contentContainerStyle={styles.content}>
-            <StaggeredFadeIn index={0}>
+          <Animated.ScrollView
+            contentContainerStyle={styles.content}
+            onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], {
+              useNativeDriver: true,
+            })}
+            scrollEventThrottle={16}
+            showsVerticalScrollIndicator={false}
+          >
+            <ScrollReveal scrollY={scrollY} viewportHeight={viewportHeight} index={0} distance={28} scaleFrom={0.985} parallax={8}>
               <View style={styles.hero}>
                 <Image source={require("../assets/branding/elfie-logo.png")} style={styles.logo} resizeMode="contain" />
                 <View style={styles.badge}>
-                  <Text style={styles.badgeText}>Clinical documentation</Text>
+                  <Text style={styles.badgeText}>Elfie Scribe</Text>
                 </View>
-                {UI_PRIVACY_MODE_ENABLED ? (
-                  <View style={styles.privacyBadge}>
-                    <Text style={styles.privacyBadgeText}>Privacy mode</Text>
-                  </View>
-                ) : null}
-                <Text style={styles.title}>Clinical notes, ready when the visit ends.</Text>
+                <Text style={styles.title}>Clinical notes and lab analysis, ready after the visit.</Text>
                 <Text style={styles.subtitle}>
-                  Record the conversation, review the note in app, and share a PDF when needed.
+                  Run the consultation workflow for visit notes, or switch to the labs analyzer for uploaded PDFs and images.
                 </Text>
-                {UI_PRIVACY_MODE_ENABLED ? (
-                  <Text style={styles.privacyCopy}>
-                    Direct identifiers are redacted before note extraction, and PDF exports omit the full transcript.
+              </View>
+            </ScrollReveal>
+
+            <View style={styles.sectionStack}>
+              <ScrollReveal scrollY={scrollY} viewportHeight={viewportHeight} index={1} distance={44} scaleFrom={0.97} parallax={12}>
+                <SectionCard eyebrow="Consultation workflow" title="Create a consultation report">
+                  <Text style={styles.cardBody}>
+                    Record a live visit or import existing audio, then review and edit the structured note before sharing a PDF.
                   </Text>
-                ) : null}
-              </View>
-            </StaggeredFadeIn>
+                  <View style={styles.actions}>
+                    <PrimaryButton label="Import Audio" onPress={() => navigateTo("/import-audio")} disabled={navBusy} />
+                    <PrimaryButton label="Start Recording" onPress={() => navigateTo("/record")} secondary disabled={navBusy} />
+                    <PrimaryButton
+                      label={`Previous Reports (${isHydrated ? storedReports.length : 0})`}
+                      onPress={() => navigateTo("/reports")}
+                      secondary
+                      disabled={navBusy}
+                    />
+                    <PrimaryButton label="Report Template" onPress={() => navigateTo("/template")} secondary disabled={navBusy} />
+                  </View>
+                  {currentTemplate ? (
+                    <Text style={styles.workflowStatus}>Active template: {currentTemplate.name}</Text>
+                  ) : (
+                    <Text style={styles.workflowStatus}>No report template selected yet.</Text>
+                  )}
+                </SectionCard>
+              </ScrollReveal>
 
-            <StaggeredFadeIn index={1}>
-              <View style={styles.actions}>
-                <PrimaryButton label="Start recording" onPress={() => navigateTo("/record")} disabled={navBusy} />
-                <PrimaryButton label="Open sample consultation" onPress={handleSamplePress} secondary disabled={navBusy} />
-                <Pressable
-                  accessibilityRole="button"
-                  disabled={navBusy}
-                  onPress={() => navigateTo("/template")}
-                  style={({ pressed }) => [styles.templatePill, navBusy && styles.disabledPill, pressed && styles.templatePillPressed]}
-                >
-                  <Text style={styles.templatePillLabel}>Import template</Text>
-                </Pressable>
-              </View>
-            </StaggeredFadeIn>
-
-            {currentTemplate ? (
-              <StaggeredFadeIn index={2}>
-                <Pressable
-                  accessibilityRole="button"
-                  disabled={navBusy}
-                  onPress={() => navigateTo("/template")}
-                  style={({ pressed }) => [styles.pressableCard, navBusy && styles.disabledPill, pressed && styles.pressableCardPressed]}
-                >
-                  <SectionCard eyebrow="Active template" title={currentTemplate.name}>
-                    <Text style={styles.cardBody}>PDF exports will use this form layout.</Text>
-                  </SectionCard>
-                </Pressable>
-              </StaggeredFadeIn>
-            ) : null}
+              <ScrollReveal scrollY={scrollY} viewportHeight={viewportHeight} index={2} distance={46} scaleFrom={0.97} parallax={12}>
+                <SectionCard eyebrow="Labs analyzer" title="Analyze a lab report">
+                  <Text style={styles.cardBody}>
+                    Upload a PDF or image, prioritize abnormal findings first, inspect normalized rows, and export a lab analysis PDF.
+                  </Text>
+                  <View style={styles.actions}>
+                    <PrimaryButton label="Analyze Lab Report" onPress={() => navigateTo("/labs/import")} disabled={navBusy} />
+                    <PrimaryButton
+                      label={`Previous Lab Analyses (${isHydrated ? storedLabReports.length : 0})`}
+                      onPress={() => navigateTo("/labs/reports")}
+                      secondary
+                      disabled={navBusy}
+                    />
+                  </View>
+                </SectionCard>
+              </ScrollReveal>
+            </View>
 
             {!isHydrated ? (
               <StaggeredFadeIn index={3}>
                 <ActivityIndicator color={colors.ink} />
               </StaggeredFadeIn>
             ) : null}
-
-            <StaggeredFadeIn index={4}>
-              <View style={styles.historyFooter}>
-                <PrimaryButton label="Previous Reports" onPress={() => navigateTo("/reports")} secondary disabled={navBusy} />
-                {isHydrated ? (
-                  <Text style={styles.historyCaption}>
-                    {storedReports.length ? `${storedReports.length} saved consultation notes` : "No saved consultation notes yet"}
-                  </Text>
-                ) : null}
-              </View>
-            </StaggeredFadeIn>
-          </ScrollView>
+          </Animated.ScrollView>
         </BrandBackground>
       </Animated.View>
 
@@ -320,22 +298,6 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
     letterSpacing: 0.6,
   },
-  privacyBadge: {
-    alignSelf: "flex-start",
-    borderRadius: radius.pill,
-    borderWidth: 1,
-    borderColor: "#f6d28b",
-    backgroundColor: "#fff7e6",
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.xs,
-  },
-  privacyBadgeText: {
-    ...typography.semibold,
-    fontSize: 12,
-    color: "#8a5a00",
-    textTransform: "uppercase",
-    letterSpacing: 0.6,
-  },
   title: {
     ...typography.title,
     fontSize: 38,
@@ -347,50 +309,17 @@ const styles = StyleSheet.create({
     lineHeight: 26,
     color: colors.textSoft,
   },
-  privacyCopy: {
-    ...typography.body,
-    fontSize: 15,
-    lineHeight: 23,
-    color: "#8a5a00",
-  },
   actions: {
     gap: spacing.md,
   },
-  templatePill: {
-    alignSelf: "center",
-    borderRadius: radius.pill,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    backgroundColor: "#fff4fa",
-    borderWidth: 1,
-    borderColor: "#ffd3ea",
-  },
-  templatePillPressed: {
-    transform: [{ scale: 0.99 }],
-    borderColor: colors.accent,
-  },
-  templatePillLabel: {
-    ...typography.semibold,
-    fontSize: 14,
-    color: colors.accent,
-  },
-  disabledPill: {
-    opacity: 0.55,
-  },
-  pressableCard: {
-    borderRadius: radius.md,
-  },
-  pressableCardPressed: {
-    transform: [{ scale: 0.992 }],
-  },
-  historyFooter: {
-    gap: spacing.sm,
-  },
-  historyCaption: {
-    ...typography.body,
-    fontSize: 14,
+  workflowStatus: {
+    ...typography.medium,
+    fontSize: 13,
+    lineHeight: 19,
     color: colors.textSoft,
-    textAlign: "center",
+  },
+  sectionStack: {
+    gap: spacing.lg,
   },
   cardMeta: {
     ...typography.medium,

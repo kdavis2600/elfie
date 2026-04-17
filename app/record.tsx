@@ -10,6 +10,7 @@ import { PrimaryButton } from "@/components/PrimaryButton";
 import { ScreenIntro } from "@/components/ScreenIntro";
 import { SectionCard } from "@/components/SectionCard";
 import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
+import { TopBackButton } from "@/components/TopBackButton";
 import { Waveform } from "@/components/Waveform";
 import { colors, radius, spacing, typography } from "@/constants/theme";
 import { configureRecordingAudioModeAsync, formatDuration, normalizeMetering } from "@/lib/audio";
@@ -152,11 +153,14 @@ export default function RecordScreen() {
   return (
     <AppScreen contentStyle={styles.container}>
       <StaggeredFadeIn index={0}>
-        <ScreenIntro
-          eyebrow="Recording"
-          title="Leave the phone on the desk."
-          subtitle="Keep the phone nearby and speak naturally. You can pause and resume at any time."
-        />
+        <View style={styles.header}>
+          <TopBackButton label="Home" onPress={handleCancel} />
+          <ScreenIntro
+            eyebrow="Recording"
+            title="Leave the phone on the desk."
+            subtitle="Keep the phone nearby and speak naturally. You can pause and resume at any time."
+          />
+        </View>
       </StaggeredFadeIn>
 
       <StaggeredFadeIn index={1}>
@@ -180,6 +184,7 @@ export default function RecordScreen() {
             label={recorderState.isRecording ? "Pause recording" : "Resume recording"}
             onPress={handlePauseResume}
             secondary
+            haptics={false}
             disabled={!isReady}
           />
           <Pressable
@@ -190,7 +195,6 @@ export default function RecordScreen() {
           >
             <View style={styles.stopInner} />
           </Pressable>
-          <PrimaryButton label="Cancel" onPress={handleCancel} secondary />
         </View>
       </StaggeredFadeIn>
     </AppScreen>
@@ -205,6 +209,9 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.xxxl,
     justifyContent: "space-between",
     gap: spacing.xl,
+  },
+  header: {
+    gap: spacing.md,
   },
   helperText: {
     ...typography.body,

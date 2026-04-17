@@ -11,78 +11,61 @@ import { SectionCard } from "@/components/SectionCard";
 import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
 import { TopBackButton } from "@/components/TopBackButton";
 import { colors, spacing, typography } from "@/constants/theme";
-import { processAudioAsync } from "@/lib/api";
-import { createMockReport } from "@/lib/mock";
-import { generateReportPdfAsync } from "@/lib/pdf";
-import { UI_PRIVACY_MODE_ENABLED } from "@/lib/privacy";
+import { analyzeLabReportAsync } from "@/lib/api";
+import { generateLabReportPdfAsync } from "@/lib/pdf";
 import { useSession } from "@/lib/session";
 import { persistPdfAsync } from "@/lib/storage";
 
-const STEPS = ["Preparing recording", "Uploading audio", "Transcribing conversation", "Drafting note", "Preparing PDF"];
+const STEPS = ["Preparing file", "Uploading document", "Extracting rows", "Ranking findings", "Preparing PDF"];
 
-export default function ProcessingScreen() {
-  const { currentTemplate, pendingAudio, setPendingAudio, setReport } = useSession();
+export default function ProcessLabReportScreen() {
+  const { pendingLabDocument, setPendingLabDocument, setLabReport } = useSession();
   const [activeStep, setActiveStep] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [isRunning, setIsRunning] = useState(true);
   const [attempt, setAttempt] = useState(0);
+  const [isRunning, setIsRunning] = useState(true);
   const completedRef = useRef(false);
-  const templateSnapshotRef = useRef(currentTemplate);
-
-  useEffect(() => {
-    if (pendingAudio) {
-      templateSnapshotRef.current = currentTemplate;
-    }
-  }, [currentTemplate, pendingAudio?.uri]);
 
   useEffect(() => {
     let cancelled = false;
 
-    if (!pendingAudio) {
+    if (!pendingLabDocument) {
       if (!completedRef.current) {
-        router.replace("/");
+        router.replace("/labs/import");
       }
       return;
     }
 
-    const audio = pendingAudio;
+    const document = pendingLabDocument;
     completedRef.current = false;
 
     async function run() {
       try {
         setError(null);
         setIsRunning(true);
-
         setActiveStep(0);
-        const result = await processAudioAsync(audio);
-        if (cancelled) {
-          return;
-        }
 
-        setActiveStep(3);
-        const report = result.report ?? createMockReport(audio.sourceType);
-        const pdfTempUri = await generateReportPdfAsync(report, templateSnapshotRef.current);
+        const result = await analyzeLabReportAsync(document);
         if (cancelled) {
           return;
         }
 
         setActiveStep(4);
-        const pdfUri = await persistPdfAsync(pdfTempUri, `${report.id}.pdf`);
-        await setReport(report, pdfUri);
+        const pdfTempUri = await generateLabReportPdfAsync(result.report);
+        if (cancelled) {
+          return;
+        }
+
+        const pdfUri = await persistPdfAsync(pdfTempUri, `${result.report.id}.pdf`);
+        await setLabReport(result.report, pdfUri);
         completedRef.current = true;
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        setPendingAudio(null);
-        router.replace("/report");
+        setPendingLabDocument(null);
+        router.replace("/labs/report");
       } catch (runError) {
-        console.error(runError);
-        const message = runError instanceof Error ? runError.message : "Audio processing failed.";
-        if (!cancelled) {
-          setError(message);
-        }
+        setError(runError instanceof Error ? runError.message : "Lab analysis failed.");
       } finally {
-        if (!cancelled) {
-          setIsRunning(false);
-        }
+        setIsRunning(false);
       }
     }
 
@@ -91,14 +74,10 @@ export default function ProcessingScreen() {
     return () => {
       cancelled = true;
     };
-  }, [attempt, pendingAudio, setPendingAudio, setReport]);
+  }, [attempt, pendingLabDocument, setLabReport, setPendingLabDocument]);
 
   useEffect(() => {
-    if (!isRunning) {
-      return;
-    }
-
-    if (activeStep >= STEPS.length - 1) {
+    if (!isRunning || activeStep >= STEPS.length - 1) {
       return;
     }
 
@@ -109,40 +88,34 @@ export default function ProcessingScreen() {
     return () => clearTimeout(timer);
   }, [activeStep, isRunning]);
 
-  function handleBackHome() {
-    setPendingAudio(null);
-    router.replace("/");
-  }
-
   return (
-    <AppScreen contentStyle={styles.container}>
+    <AppScreen scroll contentContainerStyle={styles.content}>
       <StaggeredFadeIn index={0}>
         <View style={styles.header}>
-          <TopBackButton label="Home" onPress={handleBackHome} />
+          <TopBackButton
+            label="Labs"
+            onPress={() => {
+              setPendingLabDocument(null);
+              router.replace("/labs/import");
+            }}
+          />
           <ScreenIntro
-            eyebrow="Preparing note"
-            title="Analyzing the consultation."
-            subtitle="Please keep the app open while the note and PDF are prepared."
-          >
-            {UI_PRIVACY_MODE_ENABLED ? (
-              <Text style={styles.privacyCopy}>
-                Privacy mode is on. Direct identifiers are redacted before structured extraction, and PDF export omits the
-                full transcript.
-              </Text>
-            ) : null}
-          </ScreenIntro>
+            eyebrow="Analyzing"
+            title="Processing lab report."
+            subtitle="Keep the app open while the document is extracted, normalized, ranked, and exported to PDF."
+          />
         </View>
       </StaggeredFadeIn>
 
       <StaggeredFadeIn index={1}>
-        <SectionCard eyebrow="In progress" title={error ? "We couldn't finish the note" : "Preparing your consultation note"}>
+        <SectionCard eyebrow="In progress" title={error ? "We couldn't finish the analysis" : "Preparing your lab summary"}>
           <ProgressSteps activeStep={activeStep} steps={STEPS} />
           {error ? (
             <Text style={styles.error}>{error}</Text>
           ) : (
             <View style={styles.spinnerRow}>
               <ActivityIndicator color={colors.accent} />
-              <Text style={styles.caption}>This can take up to a couple of minutes for longer consultations.</Text>
+              <Text style={styles.caption}>This may take longer than note extraction if the document is scanned.</Text>
             </View>
           )}
         </SectionCard>
@@ -151,6 +124,14 @@ export default function ProcessingScreen() {
       <StaggeredFadeIn index={2}>
         <View style={styles.actions}>
           {error ? <PrimaryButton label="Retry" onPress={() => setAttempt((value) => value + 1)} /> : null}
+          <PrimaryButton
+            label="Back to labs import"
+            onPress={() => {
+              setPendingLabDocument(null);
+              router.replace("/labs/import");
+            }}
+            secondary
+          />
         </View>
       </StaggeredFadeIn>
     </AppScreen>
@@ -158,22 +139,14 @@ export default function ProcessingScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
+  content: {
     paddingHorizontal: spacing.xl,
     paddingTop: spacing.xl,
     paddingBottom: spacing.xxxl,
-    justifyContent: "space-between",
-    gap: spacing.xl,
+    gap: spacing.lg,
   },
   header: {
     gap: spacing.md,
-  },
-  privacyCopy: {
-    ...typography.body,
-    fontSize: 15,
-    lineHeight: 22,
-    color: "#8a5a00",
   },
   spinnerRow: {
     flexDirection: "row",

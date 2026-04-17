@@ -1,11 +1,17 @@
 import Constants from "expo-constants";
+import * as FileSystem from "expo-file-system/legacy";
+import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 import { NativeModules, Platform } from "react-native";
 
+import { LabAnalysisReport, PendingLabDocument } from "@/types/labReport";
 import { ConsultationReport, PendingAudio } from "@/types/report";
-import { TemplateImportType } from "@/types/template";
+import { PdfTemplate, TemplateImportType, TemplateSanityCheck } from "@/types/template";
+import { buildTemplateSpotCheckPayload } from "@/lib/templateLayout";
 
+const RAILWAY_API_BASE_URL = "https://elfie-scribe-api-production.up.railway.app";
 const API_BASE_URL = resolveApiBaseUrl();
 const PROCESS_AUDIO_TIMEOUT_MS = 240_000;
+const ANALYZE_LAB_TIMEOUT_MS = 300_000;
 const AI_EDIT_TIMEOUT_MS = 90_000;
 const TEMPLATE_PREVIEW_TIMEOUT_MS = 30_000;
 const HEALTH_TIMEOUT_MS = 8_000;
@@ -15,6 +21,12 @@ export type ProcessAudioResult = {
   transcript: string;
   detectedLanguage: string;
   usedMock?: boolean;
+};
+
+export type AnalyzeLabReportResult = {
+  report: LabAnalysisReport;
+  usedMock?: boolean;
+  processingMode?: "mock" | "hybrid" | "qwen_only";
 };
 
 export async function processAudioAsync(audio: PendingAudio): Promise<ProcessAudioResult> {
@@ -38,6 +50,32 @@ export async function processAudioAsync(audio: PendingAudio): Promise<ProcessAud
   }
 
   return (await response.json()) as ProcessAudioResult;
+}
+
+export async function analyzeLabReportAsync(document: PendingLabDocument): Promise<AnalyzeLabReportResult> {
+  const body = new FormData();
+  body.append("sourceType", document.sourceType);
+  body.append("sizeBytes", String(document.sizeBytes ?? ""));
+  body.append("file", {
+    uri: document.uri,
+    name: document.fileName ?? `lab-report-${Date.now()}.pdf`,
+    type: document.mimeType ?? "application/pdf",
+  } as never);
+
+  const response = await fetchWithTimeoutAsync(
+    `${API_BASE_URL}/api/analyze-lab-report`,
+    {
+      method: "POST",
+      body,
+    },
+    ANALYZE_LAB_TIMEOUT_MS,
+  );
+
+  if (!response.ok) {
+    throw new Error(await readApiErrorAsync(response, "Failed to analyze the lab report."));
+  }
+
+  return (await response.json()) as AnalyzeLabReportResult;
 }
 
 export async function fetchHealthAsync() {
@@ -100,12 +138,71 @@ export async function createTemplatePreviewAsync(input: {
   };
 }
 
+export async function runTemplateSanityCheckAsync(input: {
+  template: PdfTemplate;
+  report?: ConsultationReport | null;
+}) {
+  const payload = buildTemplateSpotCheckPayload(input.template, input.report);
+  const spotCheckPreview = await manipulateAsync(
+    input.template.previewUri,
+    [
+      {
+        resize: {
+          width: payload.pageWidth,
+          height: payload.pageHeight,
+        },
+      },
+    ],
+    {
+      compress: 0.82,
+      format: SaveFormat.JPEG,
+    },
+  );
+
+  try {
+    const previewBase64 = await FileSystem.readAsStringAsync(spotCheckPreview.uri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    const response = await fetchWithTimeoutAsync(
+      `${API_BASE_URL}/api/template-sanity-check`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          previewBase64,
+          previewMimeType: "image/jpeg",
+          ...payload,
+        }),
+      },
+      60_000,
+    );
+
+    if (!response.ok) {
+      throw new Error(await readApiErrorAsync(response, "Failed to run the template spot-check."));
+    }
+
+    return (await response.json()) as TemplateSanityCheck;
+  } finally {
+    if (spotCheckPreview.uri !== input.template.previewUri) {
+      void FileSystem.deleteAsync(spotCheckPreview.uri, { idempotent: true }).catch(() => {
+        // Best-effort cache cleanup only.
+      });
+    }
+  }
+}
+
 export { API_BASE_URL };
 
 function resolveApiBaseUrl() {
   const explicitUrl = sanitizeBaseUrl(process.env.EXPO_PUBLIC_API_BASE_URL);
   if (explicitUrl) {
     return explicitUrl;
+  }
+
+  if (!__DEV__) {
+    return RAILWAY_API_BASE_URL;
   }
 
   const expoHost = extractHost(Constants.expoConfig?.hostUri ?? null);
@@ -209,12 +306,20 @@ function resolveTimeoutMessage(url: string, timeoutMs: number) {
     return "Processing took too long to respond. Please retry the consultation audio.";
   }
 
+  if (url.endsWith("/api/analyze-lab-report")) {
+    return "Lab analysis took too long to respond. Please retry with a smaller file or try again in a moment.";
+  }
+
   if (url.endsWith("/api/edit-report")) {
     return "AI editing took too long to respond. Please try a shorter instruction or retry.";
   }
 
   if (url.endsWith("/api/template-preview")) {
     return "Template preview took too long to prepare. Please try a smaller file or import a photo instead.";
+  }
+
+  if (url.endsWith("/api/template-sanity-check")) {
+    return "The template spot-check took too long to respond. Your layout is still saved locally; try the spot-check again.";
   }
 
   return `Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`;

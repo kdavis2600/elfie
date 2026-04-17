@@ -164,6 +164,24 @@ fonts, colors, and overall tone.
 - [ ] Move from Expo Go to device/TestFlight when recording, file handling, or share flows require it.
 - [ ] Reuse the existing local ASC/TestFlight workflow from `flashcard-app-react`.
 
+## Deferred: Native Share-In Audio Intake
+
+- [ ] Do not implement this until the end of the run, after the current Expo Go-friendly MVP is stable.
+- [ ] Add an iOS native share extension so `Elfie Scribe` appears in the system share sheet for supported audio files.
+- [ ] Target common audio types first:
+  - `mp3`
+  - `m4a`
+  - `wav`
+  - `aac`
+  - `mp4` audio
+- [ ] Shared audio handed off from Files, Voice Memos, Mail, or other apps should land in the same `pendingAudio -> processing` pipeline used by recording and manual import.
+- [ ] Preserve the existing in-app `Import audio` flow even after the share extension exists.
+- [ ] Treat this as a native iOS / TestFlight feature, not an Expo Go feature.
+- [ ] After implementation, verify separately in:
+  - local iOS development build
+  - TestFlight build
+- [ ] Do not block the rest of the app on this feature. If native extension work becomes risky near deadline, keep the in-app `Import audio` flow as the fallback path.
+
 ## Milestone 8: Paranoid QA Sweep
 
 - [ ] After implementation is feature-complete, generate a list of 50 concrete mistakes that are plausibly present in the repo.

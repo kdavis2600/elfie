@@ -19,8 +19,14 @@ import { ScreenIntro } from "@/components/ScreenIntro";
 import { SectionCard } from "@/components/SectionCard";
 import { StaggeredFadeIn } from "@/components/StaggeredFadeIn";
 import { TemplateRegionEditor } from "@/components/TemplateRegionEditor";
+import { TopBackButton } from "@/components/TopBackButton";
 import { colors, radius, spacing, typography } from "@/constants/theme";
-import { createTemplatePreviewAsync } from "@/lib/api";
+import { createTemplatePreviewAsync, runTemplateSanityCheckAsync } from "@/lib/api";
+import {
+  applyTemplateHeuristicDiagnostics,
+  getTemplateContentOption,
+  TEMPLATE_CONTENT_OPTIONS,
+} from "@/lib/templateLayout";
 import { createDraftTemplate, findTemplateRegion, updateTemplateRegion } from "@/lib/template";
 import { useSession } from "@/lib/session";
 import {
@@ -29,34 +35,49 @@ import {
   persistTemplateAssetAsync,
   writeTemplateBase64Async,
 } from "@/lib/storage";
-import { PdfTemplate, TemplateImportType, TemplateRegion } from "@/types/template";
+import { PdfTemplate, TemplateContentKey, TemplateImportType, TemplateRegion, TemplateSanityCheck } from "@/types/template";
 
 const REGION_STEP = 0.02;
 const SIZE_STEP = 0.04;
 
 export default function TemplateScreen() {
-  const { currentTemplate, setTemplate } = useSession();
-  const [draftTemplate, setDraftTemplate] = useState<PdfTemplate | null>(currentTemplate);
+  const { currentTemplate, currentReport, setTemplate } = useSession();
+  const [draftTemplate, setDraftTemplate] = useState<PdfTemplate | null>(() =>
+    currentTemplate ? applyTemplateHeuristicDiagnostics(currentTemplate, currentReport) : null,
+  );
   const [templateName, setTemplateName] = useState(currentTemplate?.name ?? "");
   const [selectedRegionId, setSelectedRegionId] = useState<TemplateRegion["id"]>(currentTemplate?.regions[0]?.id ?? "header");
   const [isBusy, setIsBusy] = useState(false);
+  const [isSpotChecking, setIsSpotChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [spotCheckError, setSpotCheckError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!draftTemplate && currentTemplate) {
-      setDraftTemplate(currentTemplate);
+      setDraftTemplate(applyTemplateHeuristicDiagnostics(currentTemplate, currentReport));
       setTemplateName(currentTemplate.name);
       setSelectedRegionId(currentTemplate.regions[0]?.id ?? "header");
     }
-  }, [currentTemplate, draftTemplate]);
+  }, [currentReport, currentTemplate, draftTemplate]);
+
+  useEffect(() => {
+    setDraftTemplate((current) => (current ? applyTemplateHeuristicDiagnostics(current, currentReport) : current));
+  }, [currentReport]);
 
   const selectedRegion = useMemo(
     () => (draftTemplate ? findTemplateRegion(draftTemplate, selectedRegionId) : null),
     [draftTemplate, selectedRegionId],
   );
+  const selectedContentOption = selectedRegion ? getTemplateContentOption(selectedRegion.contentKey) : null;
+  const isWorking = isBusy || isSpotChecking;
+
+  function setDraftTemplateWithDiagnostics(updater: (current: PdfTemplate) => PdfTemplate) {
+    setDraftTemplate((current) => (current ? applyTemplateHeuristicDiagnostics(updater(current), currentReport) : current));
+    setSpotCheckError(null);
+  }
 
   async function handleImport(importType: TemplateImportType) {
-    if (isBusy) {
+    if (isWorking) {
       return;
     }
 
@@ -157,7 +178,7 @@ export default function TemplateScreen() {
   }
 
   async function handleSave() {
-    if (!draftTemplate) {
+    if (!draftTemplate || isWorking) {
       return;
     }
 
@@ -181,14 +202,12 @@ export default function TemplateScreen() {
   }
 
   function handleMoveRegion(regionId: TemplateRegion["id"], nextX: number, nextY: number) {
-    setDraftTemplate((current) =>
-      current
-        ? updateTemplateRegion(current, regionId, (region) => ({
-            ...region,
-            x: nextX,
-            y: nextY,
-          }))
-        : current,
+    setDraftTemplateWithDiagnostics((current) =>
+      updateTemplateRegion(current, regionId, (region) => ({
+        ...region,
+        x: nextX,
+        y: nextY,
+      })),
     );
   }
 
@@ -197,30 +216,89 @@ export default function TemplateScreen() {
       return;
     }
 
-    setDraftTemplate((current) =>
-      current
-        ? updateTemplateRegion(current, selectedRegion.id, (region) => {
-            switch (mode) {
-              case "left":
-                return { ...region, x: region.x - REGION_STEP };
-              case "right":
-                return { ...region, x: region.x + REGION_STEP };
-              case "up":
-                return { ...region, y: region.y - REGION_STEP };
-              case "down":
-                return { ...region, y: region.y + REGION_STEP };
-              case "wider":
-                return { ...region, width: region.width + SIZE_STEP };
-              case "narrower":
-                return { ...region, width: region.width - SIZE_STEP };
-              case "taller":
-                return { ...region, height: region.height + SIZE_STEP };
-              case "shorter":
-                return { ...region, height: region.height - SIZE_STEP };
-            }
-          })
-        : current,
+    setDraftTemplateWithDiagnostics((current) =>
+      updateTemplateRegion(current, selectedRegion.id, (region) => {
+        switch (mode) {
+          case "left":
+            return { ...region, x: region.x - REGION_STEP };
+          case "right":
+            return { ...region, x: region.x + REGION_STEP };
+          case "up":
+            return { ...region, y: region.y - REGION_STEP };
+          case "down":
+            return { ...region, y: region.y + REGION_STEP };
+          case "wider":
+            return { ...region, width: region.width + SIZE_STEP };
+          case "narrower":
+            return { ...region, width: region.width - SIZE_STEP };
+          case "taller":
+            return { ...region, height: region.height + SIZE_STEP };
+          case "shorter":
+            return { ...region, height: region.height - SIZE_STEP };
+        }
+      }),
     );
+  }
+
+  function handleSelectContentKey(contentKey: TemplateContentKey) {
+    if (!selectedRegion) {
+      return;
+    }
+
+    setDraftTemplateWithDiagnostics((current) =>
+      updateTemplateRegion(current, selectedRegion.id, (region) => ({
+        ...region,
+        contentKey,
+      })),
+    );
+  }
+
+  function handleToggleRegionLabel() {
+    if (!selectedRegion) {
+      return;
+    }
+
+    setDraftTemplateWithDiagnostics((current) =>
+      updateTemplateRegion(current, selectedRegion.id, (region) => ({
+        ...region,
+        style: region.style
+          ? {
+              ...region.style,
+              showLabel: !region.style.showLabel,
+            }
+          : {
+              fontSize: 11,
+              minFontSize: 8,
+              lineHeight: 1.25,
+              paddingX: 10,
+              paddingY: 8,
+              backgroundOpacity: 0.82,
+              showLabel: false,
+            },
+      })),
+    );
+  }
+
+  async function handleRunSpotCheck() {
+    if (!draftTemplate || isWorking) {
+      return;
+    }
+
+    try {
+      setIsSpotChecking(true);
+      setSpotCheckError(null);
+      const sanityCheck = await runTemplateSanityCheckAsync({
+        template: draftTemplate,
+        report: currentReport,
+      });
+
+      setDraftTemplate((current) => (current ? mergeAiSanityCheck(current, sanityCheck) : current));
+    } catch (spotCheckError) {
+      console.error(spotCheckError);
+      setSpotCheckError(resolveSpotCheckErrorMessage(spotCheckError));
+    } finally {
+      setIsSpotChecking(false);
+    }
   }
 
   async function handleRemove() {
@@ -251,27 +329,32 @@ export default function TemplateScreen() {
 
   async function replaceDraftTemplateAsync(nextTemplate: PdfTemplate) {
     await cleanupTemplateReplacementAsync(draftTemplate, nextTemplate, currentTemplate);
-    setDraftTemplate(nextTemplate);
-    setTemplateName(nextTemplate.name);
-    setSelectedRegionId(nextTemplate.regions[0]?.id ?? "header");
+    const hydratedTemplate = applyTemplateHeuristicDiagnostics(nextTemplate, currentReport);
+    setDraftTemplate(hydratedTemplate);
+    setTemplateName(hydratedTemplate.name);
+    setSelectedRegionId(hydratedTemplate.regions[0]?.id ?? "header");
+    setSpotCheckError(null);
   }
 
   return (
     <AppScreen scroll keyboardAvoiding contentContainerStyle={styles.content}>
       <StaggeredFadeIn index={0}>
-        <ScreenIntro
-          eyebrow="Template"
-          title="Use your clinic’s form as the PDF layout."
-          subtitle="Import a blank form and Elfie will suggest where the note should be filled. Adjust the placement only if something looks off."
-        />
+        <View style={styles.header}>
+          <TopBackButton label="Home" onPress={() => router.replace("/")} disabled={isWorking} />
+          <ScreenIntro
+            eyebrow="Template"
+            title="Use your clinic’s form as the PDF layout."
+            subtitle="Import a blank form and Elfie will suggest where the note should be filled. Adjust the placement only if something looks off."
+          />
+        </View>
       </StaggeredFadeIn>
 
       <StaggeredFadeIn index={1}>
         <SectionCard eyebrow="Import" title="Choose a source">
           <View style={styles.importActions}>
-            <PrimaryButton label="Take photo" onPress={() => handleImport("photo")} secondary disabled={isBusy} />
-            <PrimaryButton label="Choose photo" onPress={() => handleImport("image")} secondary disabled={isBusy} />
-            <PrimaryButton label="Import PDF" onPress={() => handleImport("pdf")} secondary disabled={isBusy} />
+            <PrimaryButton label="Take photo" onPress={() => handleImport("photo")} secondary disabled={isWorking} />
+            <PrimaryButton label="Choose photo" onPress={() => handleImport("image")} secondary disabled={isWorking} />
+            <PrimaryButton label="Import PDF" onPress={() => handleImport("pdf")} secondary disabled={isWorking} />
           </View>
           {isBusy ? (
             <View style={styles.busyRow}>
@@ -347,14 +430,129 @@ export default function TemplateScreen() {
                   </Pressable>
                 ))}
               </View>
+              {selectedRegion && selectedContentOption ? (
+                <View style={styles.mappingPanel}>
+                  <Text style={styles.mappingTitle}>Mapped content for {selectedRegion.label}</Text>
+                  <Text style={styles.caption}>
+                    {selectedContentOption.label}: {selectedContentOption.description}
+                  </Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={handleToggleRegionLabel}
+                    style={({ pressed }) => [styles.toggleChip, pressed && styles.contentChipPressed]}
+                  >
+                    <Text style={styles.toggleChipLabel}>
+                      {selectedRegion.style?.showLabel === false ? "Overlay heading hidden" : "Overlay heading visible"}
+                    </Text>
+                  </Pressable>
+                  <View style={styles.contentChips}>
+                    {TEMPLATE_CONTENT_OPTIONS.map((option) => (
+                      <Pressable
+                        key={option.key}
+                        accessibilityRole="button"
+                        onPress={() => handleSelectContentKey(option.key)}
+                        style={({ pressed }) => [
+                          styles.contentChip,
+                          option.key === selectedRegion.contentKey && styles.contentChipSelected,
+                          pressed && styles.contentChipPressed,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.contentChipLabel,
+                            option.key === selectedRegion.contentKey && styles.contentChipLabelSelected,
+                          ]}
+                        >
+                          {option.label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              ) : null}
             </SectionCard>
           </StaggeredFadeIn>
 
           <StaggeredFadeIn index={4}>
+            <SectionCard eyebrow="Sanity check" title="Make sure the text layer still looks clean">
+              <View style={styles.sanityHeader}>
+                <View
+                  style={[
+                    styles.riskBadge,
+                    draftTemplate.sanityCheck?.overallRisk === "high"
+                      ? styles.riskBadgeHigh
+                      : draftTemplate.sanityCheck?.overallRisk === "medium"
+                        ? styles.riskBadgeMedium
+                        : styles.riskBadgeLow,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.riskBadgeLabel,
+                      draftTemplate.sanityCheck?.overallRisk === "high"
+                        ? styles.riskBadgeLabelHigh
+                        : draftTemplate.sanityCheck?.overallRisk === "medium"
+                          ? styles.riskBadgeLabelMedium
+                          : styles.riskBadgeLabelLow,
+                    ]}
+                  >
+                    {(draftTemplate.sanityCheck?.checker ?? "heuristic").toUpperCase()} ·{" "}
+                    {(draftTemplate.sanityCheck?.overallRisk ?? "low").toUpperCase()} RISK
+                  </Text>
+                </View>
+                <Text style={styles.caption}>
+                  {draftTemplate.sanityCheck?.summary ?? "The layout is using the local fit heuristic right now."}
+                </Text>
+              </View>
+              {draftTemplate.sanityCheck?.suggestions.length ? (
+                <View style={styles.suggestionList}>
+                  {draftTemplate.sanityCheck.suggestions.map((suggestion) => (
+                    <Text key={suggestion} style={styles.suggestionItem}>
+                      - {suggestion}
+                    </Text>
+                  ))}
+                </View>
+              ) : null}
+              <View style={styles.regionDiagnosticsList}>
+                {draftTemplate.regions.map((region) => {
+                  const contentOption = getTemplateContentOption(region.contentKey);
+                  const aiFinding = draftTemplate.sanityCheck?.regionFindings.find((finding) => finding.regionId === region.id);
+                  const risk = aiFinding?.overflowRisk ?? region.diagnostics?.overflowRisk ?? "low";
+
+                  return (
+                    <View key={region.id} style={styles.regionDiagnosticRow}>
+                      <View style={styles.regionDiagnosticCopy}>
+                        <Text style={styles.regionDiagnosticTitle}>{region.label}</Text>
+                        <Text style={styles.regionDiagnosticMeta}>
+                          {contentOption.label} · {risk.toUpperCase()} risk
+                        </Text>
+                        <Text style={styles.regionDiagnosticNote}>
+                          {aiFinding?.note ??
+                            region.diagnostics?.suggestions[0] ??
+                            `${contentOption.label} looks stable in the current region.`}
+                        </Text>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+              <PrimaryButton
+                label={isSpotChecking ? "Running AI spot-check…" : "Run AI spot-check"}
+                onPress={handleRunSpotCheck}
+                secondary
+                disabled={isWorking}
+              />
+              <Text style={styles.caption}>
+                The AI check is optional and only reviews layout quality. Saving the template does not depend on it.
+              </Text>
+              {spotCheckError ? <Text style={styles.error}>{spotCheckError}</Text> : null}
+            </SectionCard>
+          </StaggeredFadeIn>
+
+          <StaggeredFadeIn index={5}>
             <View style={styles.actions}>
-              <PrimaryButton label="Use template" onPress={handleSave} disabled={isBusy} />
-              <PrimaryButton label="Remove template" onPress={handleRemove} secondary disabled={isBusy} />
-              <PrimaryButton label="Back" onPress={() => router.back()} secondary disabled={isBusy} />
+              <PrimaryButton label="Use template" onPress={handleSave} disabled={isWorking} />
+              <PrimaryButton label="Remove template" onPress={handleRemove} secondary disabled={isWorking} />
             </View>
           </StaggeredFadeIn>
         </>
@@ -363,17 +561,12 @@ export default function TemplateScreen() {
           <SectionCard eyebrow="Current template" title={currentTemplate.name}>
             <Text style={styles.caption}>A template is already saved and will be used for future PDF exports.</Text>
             <View style={styles.actions}>
-              <PrimaryButton label="Remove template" onPress={handleRemove} secondary disabled={isBusy} />
-              <PrimaryButton label="Back" onPress={() => router.back()} secondary disabled={isBusy} />
+              <PrimaryButton label="Remove template" onPress={handleRemove} secondary disabled={isWorking} />
             </View>
           </SectionCard>
         </StaggeredFadeIn>
       ) : (
-        <StaggeredFadeIn index={2}>
-          <View style={styles.actions}>
-            <PrimaryButton label="Back" onPress={() => router.back()} secondary disabled={isBusy} />
-          </View>
-        </StaggeredFadeIn>
+        null
       )}
     </AppScreen>
   );
@@ -422,12 +615,51 @@ function resolveTemplateSaveError(error: unknown) {
     : "The template could not be saved right now. Please try again.";
 }
 
+function mergeAiSanityCheck(template: PdfTemplate, sanityCheck: TemplateSanityCheck): PdfTemplate {
+  return {
+    ...template,
+    sanityCheck,
+    regions: template.regions.map((region) => {
+      const finding = sanityCheck.regionFindings.find((entry) => entry.regionId === region.id);
+      if (!finding) {
+        return region;
+      }
+
+      return {
+        ...region,
+        diagnostics: {
+          checkedAt: sanityCheck.checkedAt,
+          checker: "ai",
+          overflowRisk: finding.overflowRisk,
+          estimatedLines: region.diagnostics?.estimatedLines ?? 0,
+          availableLines: region.diagnostics?.availableLines ?? 0,
+          didShrink: region.diagnostics?.didShrink ?? false,
+          didTruncate: region.diagnostics?.didTruncate ?? false,
+          suggestions: [...new Set([finding.note, ...(region.diagnostics?.suggestions ?? [])].filter(Boolean))],
+          preview: region.diagnostics?.preview ?? [],
+        },
+      };
+    }),
+  };
+}
+
+function resolveSpotCheckErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  return "The AI spot-check could not run right now. You can still save the template and rely on the local fit check.";
+}
+
 const styles = StyleSheet.create({
   content: {
     paddingHorizontal: spacing.xl,
     paddingTop: spacing.xl,
     paddingBottom: spacing.xxxl,
     gap: spacing.lg,
+  },
+  header: {
+    gap: spacing.md,
   },
   importActions: {
     gap: spacing.md,
@@ -507,5 +739,119 @@ const styles = StyleSheet.create({
   },
   actions: {
     gap: spacing.md,
+  },
+  mappingPanel: {
+    marginTop: spacing.lg,
+    gap: spacing.sm,
+  },
+  mappingTitle: {
+    ...typography.semibold,
+    color: colors.ink,
+  },
+  contentChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+  },
+  toggleChip: {
+    alignSelf: "flex-start",
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+    backgroundColor: colors.surface,
+  },
+  toggleChipLabel: {
+    ...typography.medium,
+    color: colors.ink,
+    fontSize: 13,
+  },
+  contentChip: {
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+    backgroundColor: colors.white,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  contentChipSelected: {
+    borderColor: colors.ink,
+    backgroundColor: colors.surface,
+  },
+  contentChipPressed: {
+    transform: [{ scale: 0.99 }],
+  },
+  contentChipLabel: {
+    ...typography.medium,
+    color: colors.ink,
+    fontSize: 13,
+  },
+  contentChipLabelSelected: {
+    ...typography.semibold,
+  },
+  sanityHeader: {
+    gap: spacing.sm,
+  },
+  riskBadge: {
+    alignSelf: "flex-start",
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xs,
+  },
+  riskBadgeLow: {
+    backgroundColor: "#eef8f1",
+  },
+  riskBadgeMedium: {
+    backgroundColor: "#fff3df",
+  },
+  riskBadgeHigh: {
+    backgroundColor: "#ffe8e3",
+  },
+  riskBadgeLabel: {
+    ...typography.semibold,
+    fontSize: 12,
+  },
+  riskBadgeLabelLow: {
+    color: "#1c7c43",
+  },
+  riskBadgeLabelMedium: {
+    color: "#986200",
+  },
+  riskBadgeLabelHigh: {
+    color: "#c43b18",
+  },
+  suggestionList: {
+    marginTop: spacing.md,
+    gap: spacing.xs,
+  },
+  suggestionItem: {
+    ...typography.body,
+    color: colors.ink,
+  },
+  regionDiagnosticsList: {
+    marginTop: spacing.md,
+    gap: spacing.md,
+  },
+  regionDiagnosticRow: {
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.white,
+    padding: spacing.md,
+  },
+  regionDiagnosticCopy: {
+    gap: 2,
+  },
+  regionDiagnosticTitle: {
+    ...typography.semibold,
+    color: colors.ink,
+  },
+  regionDiagnosticMeta: {
+    ...typography.medium,
+    color: colors.textSoft,
+    fontSize: 13,
+  },
+  regionDiagnosticNote: {
+    ...typography.body,
+    color: colors.ink,
   },
 });

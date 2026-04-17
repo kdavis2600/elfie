@@ -17,5 +17,5 @@ export default function LatestReportScreen() {
     return null;
   }
 
-  return <ReportDetailScreen storedReport={latestStored} onBack={() => router.replace("/")} backLabel="Back" />;
+  return <ReportDetailScreen storedReport={latestStored} onBack={() => router.replace("/")} backLabel="Home" />;
 }
