@@ -32,7 +32,10 @@ yarn-error.*
 
 # local env files
 .env
-.env*.local
+.env.*
+!.env.example
+.envrc
+.direnv/
 /lab-upload-attempts/
 
 # typescript
