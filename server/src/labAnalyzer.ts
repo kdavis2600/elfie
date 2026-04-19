@@ -36,12 +36,32 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL ?? null;
 const QWEN_REQUEST_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.QWEN_REQUEST_TIMEOUT_MS), 15_000, 240_000) ?? 180_000;
 const CLAUDE_REQUEST_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.CLAUDE_REQUEST_TIMEOUT_MS), 15_000, 240_000) ?? 180_000;
+const QWEN_JSON_REPAIR_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.QWEN_JSON_REPAIR_TIMEOUT_MS), 10_000, 60_000) ?? 30_000;
+const QWEN_LAB_VISION_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.QWEN_LAB_VISION_TIMEOUT_MS), 15_000, 120_000) ?? 60_000;
+const QWEN_LAB_EXTRACTION_TIMEOUT_MS =
+  clampInteger(parseNullableNumber(process.env.QWEN_LAB_EXTRACTION_TIMEOUT_MS), 15_000, 120_000) ?? 75_000;
+const QWEN_LAB_REASONING_TIMEOUT_MS =
+  clampInteger(parseNullableNumber(process.env.QWEN_LAB_REASONING_TIMEOUT_MS), 15_000, 150_000) ?? 90_000;
+const LAB_EXTRACTION_BATCH_MAX_CHARS =
+  clampInteger(parseNullableNumber(process.env.LAB_EXTRACTION_BATCH_MAX_CHARS), 3_000, 24_000) ?? 9_000;
+const LAB_EXTRACTION_BATCH_MAX_PAGES =
+  clampInteger(parseNullableNumber(process.env.LAB_EXTRACTION_BATCH_MAX_PAGES), 1, 4) ?? 2;
+const LAB_EXTRACTION_BATCH_CONCURRENCY =
+  clampInteger(parseNullableNumber(process.env.LAB_EXTRACTION_BATCH_CONCURRENCY), 1, 3) ?? 2;
+const LAB_EXTRACTION_PAGE_MAX_CHARS =
+  clampInteger(parseNullableNumber(process.env.LAB_EXTRACTION_PAGE_MAX_CHARS), 1_500, 8_000) ?? 4_500;
+const LAB_EXTRACTION_PAGE_MAX_LINES =
+  clampInteger(parseNullableNumber(process.env.LAB_EXTRACTION_PAGE_MAX_LINES), 25, 200) ?? 90;
 const execFileAsync = promisify(execFile);
 
 type ExtractedLabPage = {
   pageNumber: number;
   text: string;
   extractionMethod: LabExtractionMethod;
+};
+
+type PreparedLabExtractionPage = ExtractedLabPage & {
+  compactText: string;
 };
 
 type ExtractedLabDocument = {
@@ -55,6 +75,25 @@ type LocalOcrResult = {
   text: string;
   averageConfidence: number | null;
   wordCount: number;
+};
+
+type LabExtractionBatch = {
+  pages: PreparedLabExtractionPage[];
+  charCount: number;
+};
+
+type LabBatchExtractionOutcome = {
+  candidate: LabExtractionCandidate | null;
+  warnings: string[];
+  processingNotes: string[];
+  usedClaude: boolean;
+};
+
+type LabExtractionResult = {
+  candidate: LabExtractionCandidate;
+  warnings: string[];
+  processingNotes: string[];
+  extractionModel: string | null;
 };
 
 type LabExtractionCandidate = {
@@ -126,16 +165,38 @@ export async function analyzeLabDocumentAsync(inputPath: string, pendingDocument
     return finalizeLabReportForStorage(createMockLabReport(pendingDocument.sourceType), pendingDocument);
   }
 
-  let extractedDocument = await extractLabDocumentAsync(inputPath, pendingDocument.mimeType ?? null);
-  let extractionCandidate = await extractLabCandidateAsync(extractedDocument, pendingDocument);
-  let normalizedReport = buildNormalizedLabReport(extractionCandidate, extractedDocument, pendingDocument);
+  let extractedDocument: ExtractedLabDocument;
+  try {
+    extractedDocument = await extractLabDocumentAsync(inputPath, pendingDocument.mimeType ?? null);
+  } catch (error) {
+    throw new Error(`Document extraction stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
+
+  let extraction: LabExtractionResult;
+  try {
+    extraction = await extractLabCandidateAsync(extractedDocument, pendingDocument);
+  } catch (error) {
+    throw new Error(`Structured extraction stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
+
+  let normalizedReport: LabAnalysisReport;
+  try {
+    normalizedReport = buildNormalizedLabReport(extraction, extractedDocument, pendingDocument);
+  } catch (error) {
+    throw new Error(`Normalization stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
 
   if (shouldRetryImageExtractionWithVision(pendingDocument, extractedDocument, normalizedReport)) {
-    extractedDocument = await extractLabDocumentAsync(inputPath, pendingDocument.mimeType ?? null, {
-      forceImageVision: true,
-    });
-    extractionCandidate = await extractLabCandidateAsync(extractedDocument, pendingDocument);
-    const retriedReport = buildNormalizedLabReport(extractionCandidate, extractedDocument, pendingDocument);
+    try {
+      extractedDocument = await extractLabDocumentAsync(inputPath, pendingDocument.mimeType ?? null, {
+        forceImageVision: true,
+      });
+      extraction = await extractLabCandidateAsync(extractedDocument, pendingDocument);
+    } catch (error) {
+      throw new Error(`Vision retry stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
+    const retriedReport = buildNormalizedLabReport(extraction, extractedDocument, pendingDocument);
     normalizedReport = {
       ...retriedReport,
       quality: {
@@ -148,7 +209,13 @@ export async function analyzeLabDocumentAsync(inputPath: string, pendingDocument
     };
   }
 
-  const enrichedReport = await enrichLabReportAsync(normalizedReport);
+  let enrichedReport: LabAnalysisReport;
+  try {
+    enrichedReport = await enrichLabReportAsync(normalizedReport);
+  } catch (error) {
+    throw new Error(`Reasoning stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
+
   return finalizeLabReportForStorage(enrichedReport, pendingDocument);
 }
 
@@ -186,8 +253,11 @@ async function extractLabDocumentAsync(
 async function extractTextFromImageAsync(inputPath: string, mimeType: string, forceVision = false) {
   const preparedImage = await prepareImageForExtractionAsync(inputPath);
   try {
+    let fallbackOcrText = "";
+
     try {
       const ocrResult = await extractTextWithLocalOcrAsync(preparedImage.normalizedPath);
+      fallbackOcrText = ocrResult.text;
       if (!forceVision && shouldUseLocalOcr(ocrResult)) {
         return {
           text: ocrResult.text,
@@ -197,13 +267,20 @@ async function extractTextFromImageAsync(inputPath: string, mimeType: string, fo
     } catch {
       // Fall through to Qwen vision when local OCR is unavailable or fails.
     }
-    const dataUrl = await createVisionImageDataUrlAsync(inputPath, mimeType);
-    const text = await extractVisibleTextFromImageAsync(dataUrl, "lab image");
+    try {
+      const dataUrl = await createVisionImageDataUrlAsync(inputPath, mimeType);
+      const text = await extractVisibleTextFromImageAsync(dataUrl, "lab image");
 
-    return {
-      text,
-      extractionMethod: "vision" as const,
-    };
+      return {
+        text,
+        extractionMethod: "vision" as const,
+      };
+    } catch {
+      return {
+        text: fallbackOcrText,
+        extractionMethod: fallbackOcrText.trim() ? ("ocr" as const) : ("unknown" as const),
+      };
+    }
   } finally {
     await fs.rm(preparedImage.tempDir, { recursive: true, force: true });
   }
@@ -224,8 +301,14 @@ async function extractLabPdfAsync(inputPath: string): Promise<ExtractedLabDocume
 
   for (let index = 1; index <= pdf.numPages; index += 1) {
     const page = await pdf.getPage(index);
-    const textContent = await page.getTextContent();
-    const extractedText = rebuildPdfText(textContent.items ?? []);
+    let extractedText = "";
+
+    try {
+      const textContent = await page.getTextContent();
+      extractedText = rebuildPdfText(textContent.items ?? []);
+    } catch {
+      extractedText = "";
+    }
 
     if (extractedText.trim().length >= 24) {
       pages.push({
@@ -236,8 +319,14 @@ async function extractLabPdfAsync(inputPath: string): Promise<ExtractedLabDocume
       continue;
     }
 
-    const dataUrl = await renderPdfPageDataUrlAsync(page);
-    const visionText = await extractVisibleTextFromImageAsync(dataUrl, `lab pdf page ${index}`);
+    let visionText = "";
+
+    try {
+      const dataUrl = await renderPdfPageDataUrlAsync(page);
+      visionText = await extractVisibleTextFromImageAsync(dataUrl, `lab pdf page ${index}`);
+    } catch {
+      visionText = "";
+    }
 
     if (!visionText.trim()) {
       pagesWithExtractionFailures.push(index);
@@ -313,32 +402,35 @@ async function renderPdfPageDataUrlAsync(page: any) {
 }
 
 async function extractVisibleTextFromImageAsync(dataUrl: string, label: string) {
-  const response = await qwenChatCompletionAsync({
-    model: QWEN_LAB_VISION_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Extract visible text from lab report images. Preserve line breaks, numbers, test names, units, flags, and reference ranges. Do not summarize.",
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Extract the visible text from this ${label}. Return plain text only.`,
-          },
-          {
-            type: "image_url",
-            image_url: {
-              url: dataUrl,
+  const response = await qwenChatCompletionAsync(
+    {
+      model: QWEN_LAB_VISION_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract visible text from lab report images. Preserve line breaks, numbers, test names, units, flags, and reference ranges. Do not summarize.",
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Extract the visible text from this ${label}. Return plain text only.`,
             },
-          },
-        ],
-      },
-    ],
-    enable_thinking: false,
-  });
+            {
+              type: "image_url",
+              image_url: {
+                url: dataUrl,
+              },
+            },
+          ],
+        },
+      ],
+      enable_thinking: false,
+    },
+    QWEN_LAB_VISION_TIMEOUT_MS,
+  );
 
   return extractMessageText(response).trim();
 }
@@ -346,12 +438,187 @@ async function extractVisibleTextFromImageAsync(dataUrl: string, label: string) 
 async function extractLabCandidateAsync(
   extractedDocument: ExtractedLabDocument,
   pendingDocument: PendingLabDocument,
-): Promise<LabExtractionCandidate> {
-  const sourcePayload = extractedDocument.pages
-    .map((page) => `Page ${page.pageNumber} [${page.extractionMethod}]\n${page.text}`.trim())
+): Promise<LabExtractionResult> {
+  const batches = buildLabExtractionBatches(extractedDocument.pages);
+  const candidates: LabExtractionCandidate[] = [];
+  const warnings: string[] = [];
+  const processingNotes: string[] = [];
+  let extractionModel: string | null = QWEN_MODEL;
+
+  const outcomes = await mapWithConcurrencyLimit(
+    batches,
+    Math.min(LAB_EXTRACTION_BATCH_CONCURRENCY, batches.length || 1),
+    async (batch): Promise<LabBatchExtractionOutcome> => {
+      try {
+        return {
+          candidate: await extractLabCandidateBatchWithQwenAsync(batch, pendingDocument, extractedDocument.pageCount),
+          warnings: [],
+          processingNotes: [],
+          usedClaude: false,
+        };
+      } catch (error) {
+        const batchLabel = formatBatchLabel(batch);
+        const nextProcessingNotes = [
+          `Qwen extraction failed for ${batchLabel}: ${error instanceof Error ? error.message : "unknown error"}`,
+        ];
+
+        if (ANTHROPIC_API_KEY && CLAUDE_MODEL) {
+          try {
+            return {
+              candidate: await extractLabCandidateBatchWithClaudeAsync(batch, pendingDocument, extractedDocument.pageCount),
+              warnings: [`Claude extraction fallback was used for ${batchLabel} after a Qwen extraction failure.`],
+              processingNotes: nextProcessingNotes,
+              usedClaude: true,
+            };
+          } catch (fallbackError) {
+            nextProcessingNotes.push(
+              `Claude extraction fallback failed for ${batchLabel}: ${
+                fallbackError instanceof Error ? fallbackError.message : "unknown error"
+              }`,
+            );
+          }
+        }
+
+        return {
+          candidate: null,
+          warnings: [`A portion of the uploaded lab document could not be fully extracted from ${batchLabel}.`],
+          processingNotes: nextProcessingNotes,
+          usedClaude: false,
+        };
+      }
+    },
+  );
+
+  for (const outcome of outcomes) {
+    if (outcome.candidate) {
+      candidates.push(outcome.candidate);
+    }
+    warnings.push(...outcome.warnings);
+    processingNotes.push(...outcome.processingNotes);
+    if (outcome.usedClaude && CLAUDE_MODEL) {
+      extractionModel = `${QWEN_MODEL} + ${CLAUDE_MODEL}`;
+    }
+  }
+
+  let candidate = mergeLabExtractionCandidates(candidates);
+
+  if (!Array.isArray(candidate.results) || candidate.results.length === 0) {
+    const heuristicCandidate = buildHeuristicLabExtractionCandidate(extractedDocument);
+    if (Array.isArray(heuristicCandidate.results) && heuristicCandidate.results.length) {
+      candidate = mergeLabExtractionCandidates([candidate, heuristicCandidate]);
+      extractionModel = extractionModel ? `${extractionModel} + heuristic` : "heuristic";
+      warnings.push("Heuristic lab-row parsing was used because model-based extraction did not return structured rows.");
+      processingNotes.push("Fallback heuristic parsing extracted lab-like rows from the source text.");
+    }
+  }
+
+  if (batches.length > 1) {
+    processingNotes.push(
+      `The uploaded document was processed in ${batches.length} extraction batch${batches.length === 1 ? "" : "es"} to avoid long-running model timeouts.`,
+    );
+  }
+
+  return {
+    candidate,
+    warnings: dedupeStrings(warnings),
+    processingNotes: dedupeStrings(processingNotes),
+    extractionModel,
+  };
+}
+
+async function extractLabCandidateBatchWithQwenAsync(
+  batch: LabExtractionBatch,
+  pendingDocument: PendingLabDocument,
+  pageCount: number,
+) {
+  const prompt = buildLabExtractionPrompt(batch, pendingDocument, pageCount);
+  const completion = await qwenChatCompletionAsync(
+    {
+      model: QWEN_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a careful lab-data extraction assistant. Output only valid JSON and keep raw fields faithful to the source.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      response_format: {
+        type: "json_object",
+      },
+      enable_thinking: false,
+    },
+    QWEN_LAB_EXTRACTION_TIMEOUT_MS,
+  );
+
+  const parsed = parseJsonLike(extractMessageText(completion));
+  if (!parsed) {
+    throw new Error("Qwen extraction returned invalid JSON.");
+  }
+
+  return (readObject(parsed) as LabExtractionCandidate) ?? {};
+}
+
+async function extractLabCandidateBatchWithClaudeAsync(
+  batch: LabExtractionBatch,
+  pendingDocument: PendingLabDocument,
+  pageCount: number,
+) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY ?? "",
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 4000,
+      system:
+        "You extract structured laboratory results from documents. Return valid JSON only. Keep raw source fields faithful and never invent missing values.",
+      messages: [
+        {
+          role: "user",
+          content: buildLabExtractionPrompt(batch, pendingDocument, pageCount),
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(CLAUDE_REQUEST_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Claude extraction request failed (${response.status}): ${await response.text()}`);
+  }
+
+  const payload = (await response.json()) as {
+    content?: Array<{ type?: string; text?: string }>;
+  };
+  const text = Array.isArray(payload.content)
+    ? payload.content
+        .map((item) => (item.type === "text" && typeof item.text === "string" ? item.text : ""))
+        .join("")
+    : "";
+  const parsed = parseJsonLike(text);
+  if (!parsed) {
+    throw new Error("Claude extraction output was not valid JSON.");
+  }
+
+  return (readObject(parsed) as LabExtractionCandidate) ?? {};
+}
+
+function buildLabExtractionPrompt(
+  batch: LabExtractionBatch,
+  pendingDocument: PendingLabDocument,
+  pageCount: number,
+) {
+  const sourcePayload = batch.pages
+    .map((page) => `Page ${page.pageNumber} [${page.extractionMethod}]\n${page.compactText}`.trim())
     .join("\n\n");
 
-  const prompt = [
+  return [
     "Return JSON only.",
     "You are extracting structured laboratory results from a patient lab report.",
     "Never invent tests, values, ranges, units, patient identity, or page numbers.",
@@ -399,40 +666,223 @@ async function extractLabCandidateAsync(
       fileName: null,
       mimeType: pendingDocument.mimeType ?? null,
       sourceType: pendingDocument.sourceType,
-      pageCount: extractedDocument.pageCount,
+      pageCount,
+      batchPageNumbers: batch.pages.map((page) => page.pageNumber),
     })}`,
     "",
     `Source text:\n${sourcePayload}`,
   ].join("\n");
+}
 
-  const completion = await qwenChatCompletionAsync({
-    model: QWEN_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a careful lab-data extraction assistant. Output only valid JSON and keep raw fields faithful to the source.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    response_format: {
-      type: "json_object",
+function buildLabExtractionBatches(pages: ExtractedLabPage[]) {
+  const preparedPages = pages
+    .map((page) => ({
+      ...page,
+      compactText: compactLabPageText(page.text),
+    }))
+    .filter((page) => page.compactText.trim());
+
+  if (!preparedPages.length) {
+    return [] as LabExtractionBatch[];
+  }
+
+  const batches: LabExtractionBatch[] = [];
+  let currentPages: PreparedLabExtractionPage[] = [];
+  let currentChars = 0;
+
+  for (const page of preparedPages) {
+    const payloadLength = page.compactText.length + 48;
+    const wouldOverflow =
+      currentPages.length > 0 &&
+      (currentPages.length >= LAB_EXTRACTION_BATCH_MAX_PAGES || currentChars + payloadLength > LAB_EXTRACTION_BATCH_MAX_CHARS);
+
+    if (wouldOverflow) {
+      batches.push({
+        pages: currentPages,
+        charCount: currentChars,
+      });
+      currentPages = [];
+      currentChars = 0;
+    }
+
+    currentPages.push(page);
+    currentChars += payloadLength;
+  }
+
+  if (currentPages.length) {
+    batches.push({
+      pages: currentPages,
+      charCount: currentChars,
+    });
+  }
+
+  return batches;
+}
+
+function compactLabPageText(text: string) {
+  const lines = text
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return "";
+  }
+
+  const prioritized = [
+    ...lines.filter(isLikelyLabDataLine),
+    ...lines.filter((line) => isLikelyLabContextLine(line) && !isLikelyLabDataLine(line)),
+  ];
+  const selected = prioritized.length ? prioritized : lines;
+  const uniqueLines: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of selected) {
+    const key = line.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    uniqueLines.push(line);
+    if (uniqueLines.length >= LAB_EXTRACTION_PAGE_MAX_LINES) {
+      break;
+    }
+  }
+
+  return uniqueLines.join("\n").slice(0, LAB_EXTRACTION_PAGE_MAX_CHARS);
+}
+
+function isLikelyLabDataLine(line: string) {
+  if (line.length < 4 || !/[A-Za-z]/.test(line) || !/\d/.test(line)) {
+    return false;
+  }
+
+  return (
+    /(-?\d[\d,.]*)\s*(?:-|to)\s*(-?\d[\d,.]*)/i.test(line) ||
+    /(?:<=?|>=?|up to|under|over)\s*-?\d[\d,.]*/i.test(line) ||
+    /\b(?:mg\/dL|mmol\/L|g\/dL|IU\/L|U\/L|pg\/mL|ng\/mL|cells?\/u?L|x10\^?\d+\/L|%)\b/i.test(line) ||
+    /\b(?:high|low|normal|positive|negative|reactive|nonreactive|critical|abnormal)\b/i.test(line)
+  );
+}
+
+function isLikelyLabContextLine(line: string) {
+  return /\b(?:result|outcome|conclusion|interpretation|specimen|sample|hemolysis|reference range|flag|panel)\b/i.test(line);
+}
+
+function formatBatchLabel(batch: LabExtractionBatch) {
+  const pageNumbers = batch.pages.map((page) => page.pageNumber);
+  if (!pageNumbers.length) {
+    return "an empty page batch";
+  }
+
+  return pageNumbers.length === 1
+    ? `page ${pageNumbers[0]}`
+    : `pages ${pageNumbers[0]}-${pageNumbers[pageNumbers.length - 1]}`;
+}
+
+function mergeLabExtractionCandidates(candidates: LabExtractionCandidate[]) {
+  const mergedResults = candidates.flatMap((candidate) => (Array.isArray(candidate.results) ? candidate.results : []));
+  const missingInformation = dedupeStrings(
+    candidates.flatMap((candidate) => readStringArray(candidate.quality?.missingInformation)),
+  );
+  const ambiguities = dedupeStrings(candidates.flatMap((candidate) => readStringArray(candidate.quality?.ambiguities)));
+  const candidateWithPatient = candidates.find((candidate) => {
+    const patient = candidate.patient ?? {};
+    return Boolean(patient.name || patient.sex || patient.ageText || patient.patientLabel);
+  });
+  const candidateWithLanguage = candidates.find((candidate) => readNullableString(candidate.language?.detected)?.trim());
+
+  return {
+    language: {
+      detected: readNullableString(candidateWithLanguage?.language?.detected)?.trim() || null,
     },
-    enable_thinking: false,
+    patient: {
+      name: readNullableString(candidateWithPatient?.patient?.name)?.trim() || null,
+      sex: readNullableString(candidateWithPatient?.patient?.sex)?.trim() || null,
+      ageText: readNullableString(candidateWithPatient?.patient?.ageText)?.trim() || null,
+      patientLabel: readNullableString(candidateWithPatient?.patient?.patientLabel)?.trim() || null,
+    },
+    quality: {
+      missingInformation,
+      ambiguities,
+    },
+    results: mergedResults,
+  };
+}
+
+function buildHeuristicLabExtractionCandidate(extractedDocument: ExtractedLabDocument): LabExtractionCandidate {
+  const results = extractedDocument.pages.flatMap((page) => {
+    const parsedRows = page.text
+      .split(/\n+/)
+      .map((line) => parseHeuristicLabResultLine(line, page.pageNumber, page.extractionMethod))
+      .filter(Boolean);
+
+    return parsedRows as NonNullable<LabExtractionCandidate["results"]>;
   });
 
-  const parsed = await parseOrRepairJsonAsync(extractMessageText(completion));
-  return (readObject(parsed) as LabExtractionCandidate) ?? {};
+  return {
+    quality: {
+      missingInformation: [],
+      ambiguities: results.length ? ["Some lab rows were parsed heuristically because structured extraction was incomplete."] : [],
+    },
+    results,
+  };
+}
+
+function parseHeuristicLabResultLine(
+  rawLine: string,
+  pageNumber: number,
+  extractionMethod: LabExtractionMethod,
+) {
+  const line = rawLine.replace(/\s+/g, " ").trim();
+  if (!isLikelyLabDataLine(line) || line.length > 220) {
+    return null;
+  }
+
+  const valueTokenMatches = [...line.matchAll(/-?\d[\d,.]*/g)];
+  const valueToken = valueTokenMatches[0]?.[0] ?? null;
+  const valueIndex = valueToken ? line.indexOf(valueToken) : -1;
+  const testName = valueIndex > 0 ? line.slice(0, valueIndex).replace(/[:\-–]+$/, "").trim() : "";
+
+  if (!testName || !valueToken) {
+    return null;
+  }
+
+  const rangeMatch = line.match(/(-?\d[\d,.]*)\s*(?:-|to)\s*(-?\d[\d,.]*)/i);
+  const referenceRangeRaw = rangeMatch ? rangeMatch[0] : null;
+  const trailingText = line.slice(valueIndex + valueToken.length).trim();
+  const unit = trailingText
+    .replace(referenceRangeRaw ?? "", "")
+    .match(/[A-Za-z%/][A-Za-z0-9%/^.:-]*/)?.[0] ?? null;
+
+  return {
+    testNameRaw: testName,
+    testNameCanonical: null,
+    panelName: null,
+    valueRaw: valueToken,
+    unit,
+    referenceRangeRaw,
+    flagHint:
+      /\bhigh\b/.test(line) || /\bH\b/.test(line)
+        ? "high"
+        : /\blow\b/.test(line) || /\bL\b/.test(line)
+          ? "low"
+          : null,
+    pageNumber,
+    sourceSnippet: line.slice(0, 160),
+    sourceRowText: line,
+    extractionMethod,
+    confidence: 0.2,
+  };
 }
 
 function buildNormalizedLabReport(
-  candidate: LabExtractionCandidate,
+  extraction: LabExtractionResult,
   extractedDocument: ExtractedLabDocument,
   pendingDocument: PendingLabDocument,
 ): LabAnalysisReport {
+  const extractionUsedClaude = Boolean(CLAUDE_MODEL && extraction.extractionModel?.includes(CLAUDE_MODEL));
+  const candidate = extraction.candidate;
   const rawResults = Array.isArray(candidate.results) ? candidate.results : [];
   const normalizedResults = rawResults
     .map((row, index) => normalizeLabResultRow(row, index))
@@ -478,9 +928,12 @@ function buildNormalizedLabReport(
     quality: {
       missingInformation: qualityMissing,
       ambiguities: qualityAmbiguities,
-      warnings: dedupedResults.rows.length ? [] : ["No lab rows were extracted from the uploaded document."],
+      warnings: dedupeStrings([
+        ...(dedupedResults.rows.length ? [] : ["No lab rows were extracted from the uploaded document."]),
+        ...extraction.warnings,
+      ]),
       processingNotes: [
-        "Original uploaded lab documents are not persisted after processing.",
+        "Original uploaded lab documents are not persisted locally by the mobile app.",
         extractedDocument.pagesWithExtractionFailures.length
           ? `Some pages could not be fully extracted: ${extractedDocument.pagesWithExtractionFailures.join(", ")}.`
           : "All processed pages produced at least some extractable text.",
@@ -494,13 +947,14 @@ function buildNormalizedLabReport(
               "Qualitative source-text cues were used to supplement structured lab rows when the document contained outcome or specimen-quality language.",
             ]
           : []),
+        ...extraction.processingNotes,
       ],
       degradedMode: false,
     },
     sourceText: extractedDocument.sourceText,
     processing: {
-      mode: "qwen_only",
-      usedClaude: false,
+      mode: extractionUsedClaude ? "hybrid" : "qwen_only",
+      usedClaude: extractionUsedClaude,
       usedMock: false,
       pageCount: extractedDocument.pageCount,
       extractionModes: extractedDocument.pages.map((page) => ({
@@ -511,7 +965,7 @@ function buildNormalizedLabReport(
     provenance: {
       pagesWithExtractionFailures: extractedDocument.pagesWithExtractionFailures,
       failedPageCount: extractedDocument.pagesWithExtractionFailures.length,
-      extractionModel: QWEN_MODEL,
+      extractionModel: extraction.extractionModel,
       visionModel: extractedDocument.pages.some((page) => page.extractionMethod !== "text") ? QWEN_LAB_VISION_MODEL : null,
       reasoningModel: null,
     },
@@ -563,8 +1017,8 @@ function normalizeLabResultRow(
 async function enrichLabReportAsync(baseReport: LabAnalysisReport): Promise<LabAnalysisReport> {
   const reasoningPrompt = buildLabReasoningPrompt(baseReport);
   let reasoningPayload: LabReasoningPayload | null = null;
-  let processingMode: LabProcessingMode = "qwen_only";
-  let usedClaude = false;
+  let processingMode: LabProcessingMode = baseReport.processing.mode;
+  let usedClaude = baseReport.processing.usedClaude;
   const warnings = [...baseReport.quality.warnings];
   const processingNotes = [...baseReport.quality.processingNotes];
 
@@ -767,24 +1221,27 @@ async function anthropicReasoningAsync(prompt: string): Promise<LabReasoningPayl
 }
 
 async function qwenReasoningAsync(prompt: string): Promise<LabReasoningPayload> {
-  const response = await qwenChatCompletionAsync({
-    model: QWEN_LAB_REASONING_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a cautious lab-result summarizer. Output valid JSON only. Do not diagnose or overstate urgency.",
+  const response = await qwenChatCompletionAsync(
+    {
+      model: QWEN_LAB_REASONING_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a cautious lab-result summarizer. Output valid JSON only. Do not diagnose or overstate urgency.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      response_format: {
+        type: "json_object",
       },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    response_format: {
-      type: "json_object",
+      enable_thinking: false,
     },
-    enable_thinking: false,
-  });
+    QWEN_LAB_REASONING_TIMEOUT_MS,
+  );
 
   return (await parseOrRepairJsonAsync(extractMessageText(response))) as LabReasoningPayload;
 }
@@ -975,7 +1432,7 @@ function finalizeLabReportForStorage(report: LabAnalysisReport, pendingDocument:
       warnings: dedupeStrings(report.quality.warnings.map((item) => sanitizeLabText(item, patientName))),
       processingNotes: dedupeStrings([
         ...report.quality.processingNotes.map((item) => sanitizeLabText(item, patientName)),
-        "Uploaded lab documents are deleted after processing and are not persisted locally by the app.",
+        "Uploaded lab documents are not persisted locally by the app and may be retained temporarily in a server-side debug archive.",
       ]),
       degradedMode: report.quality.degradedMode,
     },
@@ -983,7 +1440,7 @@ function finalizeLabReportForStorage(report: LabAnalysisReport, pendingDocument:
   });
 }
 
-async function qwenChatCompletionAsync(body: Record<string, unknown>) {
+async function qwenChatCompletionAsync(body: Record<string, unknown>, timeoutMs = QWEN_REQUEST_TIMEOUT_MS) {
   let response: Response;
 
   try {
@@ -994,11 +1451,11 @@ async function qwenChatCompletionAsync(body: Record<string, unknown>) {
         Authorization: `Bearer ${DASHSCOPE_API_KEY}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     if (isAbortError(error)) {
-      throw new Error(`Qwen request timed out after ${Math.round(QWEN_REQUEST_TIMEOUT_MS / 1000)} seconds.`);
+      throw new Error(`Qwen request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
     }
 
     throw error;
@@ -1017,24 +1474,27 @@ async function parseOrRepairJsonAsync(raw: string) {
     return parsed;
   }
 
-  const response = await qwenChatCompletionAsync({
-    model: QWEN_REPAIR_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Fix the user's malformed JSON into valid JSON only. Do not add markdown fences. Preserve the same information and do not invent missing facts.",
+  const response = await qwenChatCompletionAsync(
+    {
+      model: QWEN_REPAIR_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Fix the user's malformed JSON into valid JSON only. Do not add markdown fences. Preserve the same information and do not invent missing facts.",
+        },
+        {
+          role: "user",
+          content: raw,
+        },
+      ],
+      response_format: {
+        type: "json_object",
       },
-      {
-        role: "user",
-        content: raw,
-      },
-    ],
-    response_format: {
-      type: "json_object",
+      enable_thinking: false,
     },
-    enable_thinking: false,
-  });
+    QWEN_JSON_REPAIR_TIMEOUT_MS,
+  );
 
   const repaired = parseJsonLike(extractMessageText(response));
   if (!repaired) {
@@ -1851,6 +2311,35 @@ function looksLikeHumanName(value: string) {
   }
 
   return tokens.every((token) => /^[\p{L}'.-]+$/u.test(token));
+}
+
+async function mapWithConcurrencyLimit<TInput, TOutput>(
+  items: TInput[],
+  concurrency: number,
+  mapper: (item: TInput, index: number) => Promise<TOutput>,
+) {
+  if (!items.length) {
+    return [] as TOutput[];
+  }
+
+  const results = new Array<TOutput>(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
 }
 
 function normalizeCompatibleBaseUrl(raw: string) {

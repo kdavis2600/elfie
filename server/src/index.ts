@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,7 +16,7 @@ import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { createMockReport } from "../../lib/mock";
 import { cleanPrivacyRedactionText, normalizeTranscriptSegments } from "../../lib/transcript";
 import { PendingLabDocument } from "../../types/labReport";
-import { ConsultationReport, PendingAudio } from "../../types/report";
+import { ConsultationReport, PendingAudio, TranscriptSegment } from "../../types/report";
 import { analyzeLabDocumentAsync, LAB_UPLOAD_LIMIT_BYTES } from "./labAnalyzer";
 import { labAnalysisReportSchema } from "./labReportSchema";
 import { consultationReportSchema } from "./reportSchema";
@@ -23,8 +24,10 @@ import { consultationReportSchema } from "./reportSchema";
 const app = express();
 const AUDIO_UPLOAD_DIR = path.join(os.tmpdir(), "elfie-audio-uploads");
 const LAB_UPLOAD_DIR = path.join(os.tmpdir(), "elfie-lab-uploads");
+const LAB_UPLOAD_ARCHIVE_DIR = path.resolve(process.env.LAB_UPLOAD_ARCHIVE_DIR ?? path.join(process.cwd(), "lab-upload-attempts"));
 mkdirSync(AUDIO_UPLOAD_DIR, { recursive: true });
 mkdirSync(LAB_UPLOAD_DIR, { recursive: true });
+mkdirSync(LAB_UPLOAD_ARCHIVE_DIR, { recursive: true });
 
 const audioUpload = multer({ dest: AUDIO_UPLOAD_DIR, limits: { fileSize: 25 * 1024 * 1024 } });
 const labUpload = multer({ dest: LAB_UPLOAD_DIR, limits: { fileSize: LAB_UPLOAD_LIMIT_BYTES } });
@@ -38,10 +41,91 @@ const QWEN_MODEL = process.env.QWEN_MODEL ?? "qwen3.5-plus";
 const QWEN_REPAIR_MODEL = process.env.QWEN_REPAIR_MODEL ?? "qwen-flash";
 const QWEN_TEMPLATE_VISION_MODEL = process.env.QWEN_TEMPLATE_VISION_MODEL ?? "qwen-vl-max-latest";
 const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL ?? null;
 const PRIVACY_MODE = parseBoolean(process.env.PRIVACY_MODE, true);
 const ASR_CHUNK_CONCURRENCY = clampInteger(parseNullableNumber(process.env.ASR_CHUNK_CONCURRENCY), 1, 3) ?? 3;
+const ASR_SEGMENT_SECONDS = clampInteger(parseNullableNumber(process.env.ASR_SEGMENT_SECONDS), 90, 240) ?? 150;
 const QWEN_REQUEST_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.QWEN_REQUEST_TIMEOUT_MS), 15_000, 240_000) ?? 180_000;
+const CLAUDE_REQUEST_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.CLAUDE_REQUEST_TIMEOUT_MS), 15_000, 240_000) ?? 180_000;
+const QWEN_JSON_REPAIR_TIMEOUT_MS = clampInteger(parseNullableNumber(process.env.QWEN_JSON_REPAIR_TIMEOUT_MS), 10_000, 60_000) ?? 30_000;
+const CONSULTATION_WINDOW_CONCURRENCY =
+  clampInteger(parseNullableNumber(process.env.CONSULTATION_WINDOW_CONCURRENCY), 1, 3) ?? 2;
+const CONSULTATION_TRANSCRIPT_WINDOW_MAX_CHARS =
+  clampInteger(parseNullableNumber(process.env.CONSULTATION_TRANSCRIPT_WINDOW_MAX_CHARS), 2_500, 12_000) ?? 6_000;
+const CONSULTATION_TRANSCRIPT_WINDOW_OVERLAP_CHARS =
+  clampInteger(parseNullableNumber(process.env.CONSULTATION_TRANSCRIPT_WINDOW_OVERLAP_CHARS), 0, 1_500) ?? 400;
+const CONSULTATION_EXTRACTION_WINDOW_TIMEOUT_MS =
+  clampInteger(parseNullableNumber(process.env.CONSULTATION_EXTRACTION_WINDOW_TIMEOUT_MS), 15_000, 120_000) ?? 60_000;
+const CONSULTATION_SYNTHESIS_TIMEOUT_MS =
+  clampInteger(parseNullableNumber(process.env.CONSULTATION_SYNTHESIS_TIMEOUT_MS), 15_000, 180_000) ?? 90_000;
 const execFileAsync = promisify(execFile);
+
+type ConsultationTranscriptWindow = {
+  index: number;
+  startChar: number;
+  endChar: number;
+  text: string;
+};
+
+type ConsultationEvidenceDiagnosis = ConsultationReport["soap"]["assessment"]["diagnoses"][number];
+type ConsultationEvidenceSegment = TranscriptSegment;
+
+type ConsultationExtractionEvidence = {
+  language?: {
+    detected?: string | null;
+  };
+  visit?: {
+    visitReason?: string | null;
+    clinicianName?: string | null;
+    patientName?: string | null;
+    visitType?: ConsultationReport["visit"]["visitType"] | null;
+  };
+  summary?: {
+    oneLiner?: string | null;
+    bullets?: string[];
+  };
+  soap?: {
+    subjective?: {
+      chiefComplaint?: string | null;
+      hpi?: string | null;
+      symptoms?: string[];
+      history?: string[];
+      medicationsMentioned?: string[];
+      allergiesMentioned?: string[];
+      patientConcerns?: string[];
+    };
+    objective?: {
+      vitals?: string[];
+      findings?: string[];
+      testsOrResults?: string[];
+      observations?: string[];
+    };
+    assessment?: {
+      summary?: string | null;
+      diagnoses?: ConsultationEvidenceDiagnosis[];
+      differentials?: string[];
+      redFlags?: string[];
+    };
+    plan?: {
+      medications?: string[];
+      testsOrdered?: string[];
+      referrals?: string[];
+      followUp?: string[];
+      patientInstructions?: string[];
+      clinicianTasks?: string[];
+      lifestyleAdvice?: string[];
+    };
+  };
+  quality?: {
+    missingInformation?: string[];
+    ambiguities?: string[];
+    notes?: string[];
+  };
+  transcript?: {
+    segments?: ConsultationEvidenceSegment[];
+  };
+};
 
 app.use(cors());
 app.use(express.json({ limit: "12mb" }));
@@ -60,6 +144,7 @@ app.get("/health", async (_req, res) => {
 app.post("/api/process-audio", audioUpload.single("file"), async (req, res) => {
   const startedAt = Date.now();
   const file = req.file;
+  const requestId = req.header("x-railway-request-id")?.trim() || randomUUID();
   const sourceType = parseSourceType(req.body?.sourceType);
   const durationSec = parseNullableNumber(req.body?.durationSec);
 
@@ -69,17 +154,32 @@ app.post("/api/process-audio", audioUpload.single("file"), async (req, res) => {
   }
 
   try {
+    const mimeType = String(file.mimetype || mime.lookup(file.originalname) || "application/octet-stream");
+    const sizeBytes = file.size ?? null;
+    logRun("received", startedAt, {
+      requestId,
+      sourceType,
+      durationSec,
+      mimeType,
+      sizeBytes,
+    });
     const pendingAudioBase: PendingAudio = {
       uri: file.originalname,
       fileName: file.originalname,
       durationSec,
-      mimeType: file.mimetype,
+      mimeType,
       sourceType,
     };
 
     if (!DASHSCOPE_API_KEY) {
       const report = finalizeReportForStorage(createMockReport(sourceType), pendingAudioBase, PRIVACY_MODE);
-      logRun("mock", startedAt, { reason: "no_api_key" });
+      logRun("mock", startedAt, {
+        requestId,
+        sourceType,
+        mimeType,
+        sizeBytes,
+        reason: "no_api_key",
+      });
       res.json({
         report,
         transcript: report.transcript.fullText,
@@ -89,22 +189,56 @@ app.post("/api/process-audio", audioUpload.single("file"), async (req, res) => {
       return;
     }
 
-    const { transcript, actualDurationSec } = await transcribeAudioAsync(file.path);
+    let transcriptPayload: {
+      transcript: string;
+      actualDurationSec: number | null;
+    };
+    try {
+      transcriptPayload = await transcribeAudioAsync(file.path);
+    } catch (error) {
+      throw new Error(`Transcription stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
+    const { transcript, actualDurationSec } = transcriptPayload;
+    logRun("transcribed", startedAt, {
+      requestId,
+      sourceType,
+      mimeType,
+      sizeBytes,
+      actualDurationSec,
+      transcriptLength: transcript.length,
+    });
     const pendingAudio: PendingAudio = {
       ...pendingAudioBase,
       durationSec: actualDurationSec ?? durationSec,
     };
     const redactedTranscript = PRIVACY_MODE ? redactSensitiveText(transcript) : transcript;
-    const extractedReport = await extractReportAsync({
-      transcript: redactedTranscript,
-      audio: pendingAudio,
+    logRun("extracting_report", startedAt, {
+      requestId,
+      sourceType,
+      mimeType,
+      sizeBytes,
+      transcriptLength: redactedTranscript.length,
       privacyMode: PRIVACY_MODE,
     });
+    let extractedReport: ConsultationReport;
+    try {
+      extractedReport = await extractReportAsync({
+        transcript: redactedTranscript,
+        audio: pendingAudio,
+        privacyMode: PRIVACY_MODE,
+      });
+    } catch (error) {
+      throw new Error(`Consultation extraction stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
     const report = finalizeReportForStorage(extractedReport, pendingAudio, PRIVACY_MODE);
 
     logRun("success", startedAt, {
+      requestId,
       sourceType,
       durationSec,
+      mimeType,
+      sizeBytes,
       transcriptLength: transcript.length,
     });
 
@@ -117,8 +251,11 @@ app.post("/api/process-audio", audioUpload.single("file"), async (req, res) => {
   } catch (error) {
     console.error("[process-audio] failed", error);
     logRun("failure", startedAt, {
+      requestId,
       sourceType,
       durationSec,
+      mimeType: String(file.mimetype || mime.lookup(file.originalname) || "application/octet-stream"),
+      sizeBytes: file.size ?? null,
       error: error instanceof Error ? error.message : "unknown",
     });
     const message = error instanceof Error ? error.message : "Processing failed.";
@@ -162,8 +299,16 @@ app.post("/api/edit-report", async (req, res) => {
 app.post("/api/analyze-lab-report", labUpload.single("file"), async (req, res) => {
   const startedAt = Date.now();
   const file = req.file;
+  const requestId = req.header("x-railway-request-id")?.trim() || randomUUID();
   const sourceType = parseLabSourceType(req.body?.sourceType);
   const sizeBytes = parseNullableNumber(req.body?.sizeBytes) ?? file?.size ?? null;
+  let archivedAttempt:
+    | {
+        attemptId: string;
+        filePath: string;
+        metadataPath: string;
+      }
+    | null = null;
 
   if (!file) {
     res.status(400).send("Missing lab document file.");
@@ -171,8 +316,37 @@ app.post("/api/analyze-lab-report", labUpload.single("file"), async (req, res) =
   }
 
   const mimeType = file.mimetype || mime.lookup(file.originalname) || "application/octet-stream";
+  logRun("received", startedAt, {
+    scope: "elfie-analyze-labs",
+    requestId,
+    sourceType,
+    mimeType: String(mimeType),
+    sizeBytes,
+  });
+
+  archivedAttempt = await archiveLabAttemptInputAsync({
+    file,
+    mimeType: String(mimeType),
+    sourceType,
+    sizeBytes,
+    requestId,
+  });
 
   if (!isSupportedLabDocumentMimeType(String(mimeType))) {
+    logRun("rejected", startedAt, {
+      scope: "elfie-analyze-labs",
+      requestId,
+      attemptId: archivedAttempt?.attemptId ?? null,
+      sourceType,
+      mimeType: String(mimeType),
+      sizeBytes,
+      error: "Unsupported lab document MIME type.",
+    });
+    await finalizeArchivedLabAttemptAsync(archivedAttempt, {
+      status: "rejected",
+      error: "Unsupported lab document MIME type.",
+      httpStatus: 400,
+    });
     res.status(400).send("Lab analysis supports PDF, JPG, PNG, WEBP, and HEIC/HEIF uploads only.");
     return;
   }
@@ -186,14 +360,56 @@ app.post("/api/analyze-lab-report", labUpload.single("file"), async (req, res) =
       sourceType,
     };
 
-    const report = labAnalysisReportSchema.parse(await analyzeLabDocumentAsync(file.path, pendingDocument));
+    logRun("archived", startedAt, {
+      scope: "elfie-analyze-labs",
+      requestId,
+      attemptId: archivedAttempt?.attemptId ?? null,
+      sourceType,
+      mimeType: String(mimeType),
+      sizeBytes,
+    });
+    logRun("analyzing", startedAt, {
+      scope: "elfie-analyze-labs",
+      requestId,
+      attemptId: archivedAttempt?.attemptId ?? null,
+      sourceType,
+      mimeType: String(mimeType),
+      sizeBytes,
+    });
+
+    let analyzedReport: Awaited<ReturnType<typeof analyzeLabDocumentAsync>>;
+    try {
+      analyzedReport = await analyzeLabDocumentAsync(file.path, pendingDocument);
+    } catch (error) {
+      throw new Error(`Lab analysis stage failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
+    const report = labAnalysisReportSchema.parse(analyzedReport);
 
     logRun(report.processing.usedMock ? "mock" : "success", startedAt, {
       scope: "elfie-analyze-labs",
+      requestId,
+      attemptId: archivedAttempt?.attemptId ?? null,
       sourceType,
+      mimeType: String(mimeType),
+      sizeBytes,
       processingMode: report.processing.mode,
       resultCount: report.results.length,
       pageCount: report.sourceDocument.pageCount ?? null,
+    });
+
+    await finalizeArchivedLabAttemptAsync(archivedAttempt, {
+      status: report.processing.usedMock ? "mock" : "success",
+      mimeType: String(mimeType),
+      sourceType,
+      sizeBytes,
+      processingMode: report.processing.mode,
+      resultCount: report.results.length,
+      pageCount: report.sourceDocument.pageCount ?? null,
+      degradedMode: report.quality.degradedMode,
+      warnings: report.quality.warnings,
+      processingNotes: report.quality.processingNotes,
+      httpStatus: 200,
     });
 
     res.json({
@@ -205,8 +421,20 @@ app.post("/api/analyze-lab-report", labUpload.single("file"), async (req, res) =
     console.error("[analyze-lab-report] failed", error);
     logRun("failure", startedAt, {
       scope: "elfie-analyze-labs",
+      requestId,
+      attemptId: archivedAttempt?.attemptId ?? null,
       sourceType,
+      mimeType: String(mimeType),
+      sizeBytes,
       error: error instanceof Error ? error.message : "unknown",
+    });
+    await finalizeArchivedLabAttemptAsync(archivedAttempt, {
+      status: "failure",
+      mimeType: String(mimeType),
+      sourceType,
+      sizeBytes,
+      error: error instanceof Error ? error.message : "unknown",
+      httpStatus: resolveServerErrorStatus(error),
     });
     const message = error instanceof Error ? error.message : "Lab analysis failed.";
     res.status(resolveServerErrorStatus(error)).send(message);
@@ -297,6 +525,94 @@ app.listen(PORT, () => {
   console.log(`[elfie-scribe-api] listening on http://0.0.0.0:${PORT}`);
 });
 
+async function archiveLabAttemptInputAsync(input: {
+  file: Express.Multer.File;
+  mimeType: string;
+  sourceType: PendingLabDocument["sourceType"];
+  sizeBytes: number | null;
+  requestId: string;
+}) {
+  const attemptId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${input.requestId}`;
+  const extension = resolveArchiveExtension(input.file.originalname, input.mimeType);
+  const safeBaseName = `${attemptId}${extension ? `.${extension}` : ""}`;
+  const filePath = path.join(LAB_UPLOAD_ARCHIVE_DIR, safeBaseName);
+  const metadataPath = path.join(LAB_UPLOAD_ARCHIVE_DIR, `${attemptId}.json`);
+
+  try {
+    await fs.copyFile(input.file.path, filePath);
+    await fs.writeFile(
+      metadataPath,
+      JSON.stringify(
+        {
+          attemptId,
+          requestId: input.requestId,
+          receivedAt: new Date().toISOString(),
+          originalFileName: input.file.originalname,
+          archivedFileName: safeBaseName,
+          mimeType: input.mimeType,
+          sourceType: input.sourceType,
+          sizeBytes: input.sizeBytes,
+          status: "received",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    return { attemptId, filePath, metadataPath };
+  } catch (error) {
+    console.error("[archive-lab-attempt] failed", error);
+    return null;
+  }
+}
+
+async function finalizeArchivedLabAttemptAsync(
+  archivedAttempt: { attemptId: string; filePath: string; metadataPath: string } | null,
+  patch: Record<string, unknown>,
+) {
+  if (!archivedAttempt) {
+    return;
+  }
+
+  try {
+    let existing: Record<string, unknown> = {};
+    try {
+      existing = JSON.parse(await fs.readFile(archivedAttempt.metadataPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      existing = {
+        attemptId: archivedAttempt.attemptId,
+      };
+    }
+
+    await fs.writeFile(
+      archivedAttempt.metadataPath,
+      JSON.stringify(
+        {
+          ...existing,
+          ...patch,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  } catch (error) {
+    console.error("[archive-lab-attempt] finalize failed", error);
+  }
+}
+
+function resolveArchiveExtension(fileName: string, mimeType: string) {
+  const fromName = path.extname(fileName).replace(/^\./, "").trim().toLowerCase();
+  if (fromName) {
+    return fromName;
+  }
+
+  const fromMime = mime.extension(mimeType);
+  return typeof fromMime === "string" ? fromMime.toLowerCase() : "";
+}
+
 async function transcribeAudioAsync(inputPath: string) {
   const prepared = await prepareAudioChunksAsync(inputPath);
 
@@ -360,19 +676,274 @@ async function extractReportAsync({
   audio: PendingAudio;
   privacyMode: boolean;
 }) {
-  const prompt = [
+  const windows = buildConsultationTranscriptWindows(transcript);
+  const evidenceParts = await mapWithConcurrencyLimit(
+    windows,
+    Math.min(CONSULTATION_WINDOW_CONCURRENCY, windows.length),
+    async (window) => extractConsultationEvidenceWindowAsync(window, windows.length, audio, privacyMode),
+  );
+  const mergedEvidence = mergeConsultationEvidence(evidenceParts);
+  const prompt = buildConsultationSynthesisPrompt(transcript, audio, privacyMode, mergedEvidence, windows.length);
+
+  try {
+    const completion = await qwenChatCompletionAsync(
+      {
+        model: QWEN_MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a careful clinical documentation assistant. Output only JSON. The word JSON appears here to satisfy structured-output style parsers.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        response_format: {
+          type: "json_object",
+        },
+        enable_thinking: false,
+      },
+      CONSULTATION_SYNTHESIS_TIMEOUT_MS,
+    );
+
+    return repairAndValidateAsync(extractMessageText(completion), transcript, audio, privacyMode, mergedEvidence);
+  } catch (qwenError) {
+    console.warn("[process-audio] qwen consultation synthesis failed, trying fallback", {
+      error: qwenError instanceof Error ? qwenError.message : "unknown",
+      transcriptLength: transcript.length,
+      windows: windows.length,
+    });
+
+    if (ANTHROPIC_API_KEY && CLAUDE_MODEL) {
+      try {
+        const content = await claudeTextCompletionAsync({
+          systemPrompt:
+            "You are a careful clinical documentation assistant. Return valid JSON only. Never invent facts or identifiers.",
+          userPrompt: prompt,
+          maxTokens: 3200,
+          timeoutMs: CONSULTATION_SYNTHESIS_TIMEOUT_MS,
+        });
+        return repairAndValidateAsync(content, transcript, audio, privacyMode, mergedEvidence);
+      } catch (claudeError) {
+        console.warn("[process-audio] claude consultation synthesis fallback failed", {
+          error: claudeError instanceof Error ? claudeError.message : "unknown",
+          transcriptLength: transcript.length,
+          windows: windows.length,
+        });
+      }
+    }
+
+    const heuristicCandidate = buildHeuristicConsultationReportCandidate(
+      mergedEvidence,
+      qwenError instanceof Error ? qwenError.message : "Consultation synthesis failed.",
+    );
+    const normalized = mergeReportWithEvidence(normalizeReport(heuristicCandidate, transcript, audio, privacyMode), mergedEvidence);
+    return consultationReportSchema.parse(normalized);
+  }
+}
+
+async function repairAndValidateAsync(
+  raw: string,
+  transcript: string,
+  audio: PendingAudio,
+  privacyMode: boolean,
+  mergedEvidence?: ConsultationExtractionEvidence,
+) {
+  const candidate = await parseOrRepairJsonAsync(raw, {
+    preferClaude: true,
+    repairTimeoutMs: QWEN_JSON_REPAIR_TIMEOUT_MS,
+  });
+  const normalized = mergeReportWithEvidence(normalizeReport(candidate, transcript, audio, privacyMode), mergedEvidence);
+  return consultationReportSchema.parse(normalized);
+}
+
+async function extractConsultationEvidenceWindowAsync(
+  window: ConsultationTranscriptWindow,
+  totalWindows: number,
+  audio: PendingAudio,
+  privacyMode: boolean,
+) {
+  const prompt = buildConsultationEvidencePrompt(window, totalWindows, audio, privacyMode);
+
+  try {
+    const completion = await qwenChatCompletionAsync(
+      {
+        model: QWEN_MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You extract structured consultation evidence from transcript windows. Output valid JSON only and never invent missing facts.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        response_format: {
+          type: "json_object",
+        },
+        enable_thinking: false,
+      },
+      CONSULTATION_EXTRACTION_WINDOW_TIMEOUT_MS,
+    );
+
+    const parsed = parseJsonLike(extractMessageText(completion));
+    if (!parsed) {
+      throw new Error("Qwen consultation evidence extraction returned invalid JSON.");
+    }
+
+    return normalizeConsultationEvidence(parsed);
+  } catch (qwenError) {
+    if (ANTHROPIC_API_KEY && CLAUDE_MODEL) {
+      try {
+        const content = await claudeTextCompletionAsync({
+          systemPrompt:
+            "You extract structured consultation evidence from transcript windows. Return valid JSON only and never invent facts.",
+          userPrompt: prompt,
+          maxTokens: 2400,
+          timeoutMs: CONSULTATION_EXTRACTION_WINDOW_TIMEOUT_MS,
+        });
+        const parsed = parseJsonLike(content);
+        if (!parsed) {
+          throw new Error("Claude consultation evidence extraction returned invalid JSON.");
+        }
+
+        const evidence = normalizeConsultationEvidence(parsed);
+        return {
+          ...evidence,
+          quality: {
+            ...evidence.quality,
+            notes: dedupeStrings([
+              ...(evidence.quality?.notes ?? []),
+              `Claude evidence fallback was used for transcript window ${window.index + 1}.`,
+            ]),
+          },
+        };
+      } catch (claudeError) {
+        return buildFallbackConsultationEvidence(window, qwenError, claudeError);
+      }
+    }
+
+    return buildFallbackConsultationEvidence(window, qwenError);
+  }
+}
+
+function buildConsultationEvidencePrompt(
+  window: ConsultationTranscriptWindow,
+  totalWindows: number,
+  audio: PendingAudio,
+  privacyMode: boolean,
+) {
+  return [
+    "Return JSON only.",
+    "You are extracting structured evidence from one window of a clinical consultation transcript.",
+    "Never invent names, diagnoses, medications, doses, allergies, vitals, or follow-up dates.",
+    "Capture only facts that are grounded in this transcript window.",
+    "If a detail is missing or uncertain, use null or an empty array and record it in quality.missingInformation or quality.ambiguities.",
+    "Use English for normalized fields while preserving source meaning.",
+    "Keep transcript.segments short and limited to the most informative speaker turns from this window.",
+    privacyMode
+      ? "Privacy mode is enabled. Direct identifiers may already be redacted. Never restore or infer them."
+      : "Use names only when clearly present in this transcript window.",
+    "",
+    "Required JSON shape:",
+    JSON.stringify(
+      {
+        language: {
+          detected: "language code|null",
+        },
+        visit: {
+          visitReason: "string|null",
+          clinicianName: "string|null",
+          patientName: "string|null",
+          visitType: "new|follow_up|urgent|unknown|null",
+        },
+        summary: {
+          oneLiner: "string|null",
+          bullets: ["string"],
+        },
+        soap: {
+          subjective: {
+            chiefComplaint: "string|null",
+            hpi: "string|null",
+            symptoms: ["string"],
+            history: ["string"],
+            medicationsMentioned: ["string"],
+            allergiesMentioned: ["string"],
+            patientConcerns: ["string"],
+          },
+          objective: {
+            vitals: ["string"],
+            findings: ["string"],
+            testsOrResults: ["string"],
+            observations: ["string"],
+          },
+          assessment: {
+            summary: "string|null",
+            diagnoses: [{ name: "string", confidence: "confirmed|likely|possible|unclear|null" }],
+            differentials: ["string"],
+            redFlags: ["string"],
+          },
+          plan: {
+            medications: ["string"],
+            testsOrdered: ["string"],
+            referrals: ["string"],
+            followUp: ["string"],
+            patientInstructions: ["string"],
+            clinicianTasks: ["string"],
+            lifestyleAdvice: ["string"],
+          },
+        },
+        quality: {
+          missingInformation: ["string"],
+          ambiguities: ["string"],
+          notes: ["string"],
+        },
+        transcript: {
+          segments: [{ speaker: "doctor|patient|unknown", text: "string", startSec: 0, endSec: 1 }],
+        },
+      },
+      null,
+      2,
+    ),
+    "",
+    `Source metadata: ${JSON.stringify({
+      fileName: privacyMode ? null : (audio.fileName ?? null),
+      durationSec: audio.durationSec ?? null,
+      sourceType: audio.sourceType,
+      windowIndex: window.index + 1,
+      totalWindows,
+      startChar: window.startChar,
+      endChar: window.endChar,
+    })}`,
+    "",
+    `Transcript window:\n${window.text}`,
+  ].join("\n");
+}
+
+function buildConsultationSynthesisPrompt(
+  transcript: string,
+  audio: PendingAudio,
+  privacyMode: boolean,
+  evidence: ConsultationExtractionEvidence,
+  windowCount: number,
+) {
+  return [
     "Return JSON only.",
     "You are generating a structured clinical consultation report for a hackathon MVP.",
     "Never invent names, diagnoses, medications, doses, allergies, vitals, or follow-up dates.",
     "If details are missing, use empty arrays, null, or 'unknown' and list the gaps in quality.missingInformation.",
     "If uncertain, capture the uncertainty in quality.ambiguities and lower diagnosis confidence.",
-    "Report language must be English while preserving the original transcript text.",
-    "Include transcript.fullText exactly as the transcript input.",
-    "Populate transcript.segments with short speaker turns whenever possible.",
-    "Infer likely doctor and patient turns from the consultation context. Use unknown only when the speaker truly cannot be inferred.",
+    "Report language must be English while preserving the original transcript meaning.",
+    "Populate transcript.segments with concise, useful speaker turns when possible.",
+    "The system will restore transcript.fullText separately, so leave transcript.fullText as an empty string.",
+    "Prioritize grounded synthesis from the merged evidence. Use the transcript excerpt only as supporting context.",
     privacyMode
-      ? "Privacy mode is enabled. Direct identifiers may already be removed or replaced with generic role labels or placeholders. Never restore, infer, or fabricate them."
-      : "If names are genuinely present in the transcript, you may include them.",
+      ? "Privacy mode is enabled. Direct identifiers may already be removed or replaced with placeholders. Never restore, infer, or fabricate them."
+      : "If names are genuinely present in the evidence, you may include them.",
     privacyMode ? "Set visit.patientName and visit.clinicianName to null." : "Use null for names when they are missing.",
     "",
     "Required JSON shape:",
@@ -436,7 +1007,7 @@ async function extractReportAsync({
           ambiguities: ["string"],
         },
         transcript: {
-          fullText: "string",
+          fullText: "",
           segments: [{ speaker: "doctor|patient|unknown", startSec: 0, endSec: 1, text: "string" }],
         },
       },
@@ -448,45 +1019,442 @@ async function extractReportAsync({
       fileName: privacyMode ? null : (audio.fileName ?? null),
       durationSec: audio.durationSec ?? null,
       sourceType: audio.sourceType,
+      transcriptLength: transcript.length,
+      extractionWindows: windowCount,
     })}`,
     "",
-    `Transcript:\n${transcript}`,
+    `Merged evidence:\n${JSON.stringify(evidence, null, 2)}`,
+    "",
+    `Transcript excerpt:\n${buildConsultationTranscriptExcerpt(transcript)}`,
   ].join("\n");
-
-  const completion = await qwenChatCompletionAsync({
-    model: QWEN_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a careful clinical documentation assistant. Output only JSON. The word JSON appears here to satisfy structured-output style parsers.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    response_format: {
-      type: "json_object",
-    },
-    enable_thinking: false,
-  });
-
-  const content = extractMessageText(completion);
-  const parsed = await repairAndValidateAsync(content, transcript, audio, privacyMode);
-
-  return parsed;
 }
 
-async function repairAndValidateAsync(
-  raw: string,
-  transcript: string,
-  audio: PendingAudio,
-  privacyMode: boolean,
-) {
-  const candidate = await parseOrRepairJsonAsync(raw);
-  const normalized = normalizeReport(candidate, transcript, audio, privacyMode);
-  return consultationReportSchema.parse(normalized);
+function normalizeConsultationEvidence(input: unknown): ConsultationExtractionEvidence {
+  const root = readObject(input);
+  const visit = readObject(root.visit);
+  const summary = readObject(root.summary);
+  const soap = readObject(root.soap);
+  const subjective = readObject(soap.subjective);
+  const objective = readObject(soap.objective);
+  const assessment = readObject(soap.assessment);
+  const plan = readObject(soap.plan);
+  const quality = readObject(root.quality);
+
+  return {
+    language: {
+      detected: readNullableString(readObject(root.language).detected, null),
+    },
+    visit: {
+      visitReason: readNullableString(visit.visitReason, null),
+      clinicianName: readNullableString(visit.clinicianName, null),
+      patientName: readNullableString(visit.patientName, null),
+      visitType: normalizeConsultationVisitType(visit.visitType, null),
+    },
+    summary: {
+      oneLiner: readNullableString(summary.oneLiner, null),
+      bullets: readStringArray(summary.bullets, []),
+    },
+    soap: {
+      subjective: {
+        chiefComplaint: readNullableString(subjective.chiefComplaint, null),
+        hpi: readNullableString(subjective.hpi, null),
+        symptoms: readStringArray(subjective.symptoms, []),
+        history: readStringArray(subjective.history, []),
+        medicationsMentioned: readStringArray(subjective.medicationsMentioned, []),
+        allergiesMentioned: readStringArray(subjective.allergiesMentioned, []),
+        patientConcerns: readStringArray(subjective.patientConcerns, []),
+      },
+      objective: {
+        vitals: readStringArray(objective.vitals, []),
+        findings: readStringArray(objective.findings, []),
+        testsOrResults: readStringArray(objective.testsOrResults, []),
+        observations: readStringArray(objective.observations, []),
+      },
+      assessment: {
+        summary: readNullableString(assessment.summary, null),
+        diagnoses: normalizeConsultationDiagnosisArray(assessment.diagnoses),
+        differentials: readStringArray(assessment.differentials, []),
+        redFlags: readStringArray(assessment.redFlags, []),
+      },
+      plan: {
+        medications: readStringArray(plan.medications, []),
+        testsOrdered: readStringArray(plan.testsOrdered, []),
+        referrals: readStringArray(plan.referrals, []),
+        followUp: readStringArray(plan.followUp, []),
+        patientInstructions: readStringArray(plan.patientInstructions, []),
+        clinicianTasks: readStringArray(plan.clinicianTasks, []),
+        lifestyleAdvice: readStringArray(plan.lifestyleAdvice, []),
+      },
+    },
+    quality: {
+      missingInformation: readStringArray(quality.missingInformation, []),
+      ambiguities: readStringArray(quality.ambiguities, []),
+      notes: readStringArray(quality.notes, []),
+    },
+    transcript: {
+      segments: normalizeConsultationSegments(readObject(root.transcript).segments),
+    },
+  };
+}
+
+function buildFallbackConsultationEvidence(
+  window: ConsultationTranscriptWindow,
+  qwenError: unknown,
+  claudeError?: unknown,
+): ConsultationExtractionEvidence {
+  const notes = [
+    `Qwen consultation evidence extraction failed for transcript window ${window.index + 1}: ${
+      qwenError instanceof Error ? qwenError.message : "unknown error"
+    }`,
+  ];
+
+  if (claudeError) {
+    notes.push(
+      `Claude consultation evidence fallback failed for transcript window ${window.index + 1}: ${
+        claudeError instanceof Error ? claudeError.message : "unknown error"
+      }`,
+    );
+  }
+
+  return {
+    quality: {
+      missingInformation: [`Transcript window ${window.index + 1} required degraded extraction handling.`],
+      ambiguities: [],
+      notes,
+    },
+    transcript: {
+      segments: buildFallbackTranscriptSegments(window.text, 4),
+    },
+  };
+}
+
+function mergeConsultationEvidence(evidenceParts: ConsultationExtractionEvidence[]) {
+  const merged: ConsultationExtractionEvidence = {
+    language: { detected: "unknown" },
+    visit: {
+      visitReason: null,
+      clinicianName: null,
+      patientName: null,
+      visitType: null,
+    },
+    summary: {
+      oneLiner: null,
+      bullets: [],
+    },
+    soap: {
+      subjective: {
+        chiefComplaint: null,
+        hpi: null,
+        symptoms: [],
+        history: [],
+        medicationsMentioned: [],
+        allergiesMentioned: [],
+        patientConcerns: [],
+      },
+      objective: {
+        vitals: [],
+        findings: [],
+        testsOrResults: [],
+        observations: [],
+      },
+      assessment: {
+        summary: null,
+        diagnoses: [],
+        differentials: [],
+        redFlags: [],
+      },
+      plan: {
+        medications: [],
+        testsOrdered: [],
+        referrals: [],
+        followUp: [],
+        patientInstructions: [],
+        clinicianTasks: [],
+        lifestyleAdvice: [],
+      },
+    },
+    quality: {
+      missingInformation: [],
+      ambiguities: [],
+      notes: [],
+    },
+    transcript: {
+      segments: [],
+    },
+  };
+
+  for (const evidence of evidenceParts) {
+    merged.language!.detected =
+      merged.language!.detected && merged.language!.detected !== "unknown"
+        ? merged.language!.detected
+        : evidence.language?.detected ?? merged.language!.detected;
+
+    merged.visit!.visitReason = preferLongerString(merged.visit!.visitReason, evidence.visit?.visitReason ?? null);
+    merged.visit!.clinicianName = preferLongerString(merged.visit!.clinicianName, evidence.visit?.clinicianName ?? null);
+    merged.visit!.patientName = preferLongerString(merged.visit!.patientName, evidence.visit?.patientName ?? null);
+    merged.visit!.visitType = normalizeConsultationVisitType(evidence.visit?.visitType, merged.visit!.visitType ?? null);
+
+    merged.summary!.oneLiner = preferLongerString(merged.summary!.oneLiner, evidence.summary?.oneLiner ?? null);
+    merged.summary!.bullets = dedupeStrings([...(merged.summary!.bullets ?? []), ...(evidence.summary?.bullets ?? [])]);
+
+    merged.soap!.subjective!.chiefComplaint = preferLongerString(
+      merged.soap!.subjective!.chiefComplaint,
+      evidence.soap?.subjective?.chiefComplaint ?? null,
+    );
+    merged.soap!.subjective!.hpi = preferLongerString(merged.soap!.subjective!.hpi, evidence.soap?.subjective?.hpi ?? null);
+    merged.soap!.subjective!.symptoms = dedupeStrings([
+      ...(merged.soap!.subjective!.symptoms ?? []),
+      ...(evidence.soap?.subjective?.symptoms ?? []),
+    ]);
+    merged.soap!.subjective!.history = dedupeStrings([
+      ...(merged.soap!.subjective!.history ?? []),
+      ...(evidence.soap?.subjective?.history ?? []),
+    ]);
+    merged.soap!.subjective!.medicationsMentioned = dedupeStrings([
+      ...(merged.soap!.subjective!.medicationsMentioned ?? []),
+      ...(evidence.soap?.subjective?.medicationsMentioned ?? []),
+    ]);
+    merged.soap!.subjective!.allergiesMentioned = dedupeStrings([
+      ...(merged.soap!.subjective!.allergiesMentioned ?? []),
+      ...(evidence.soap?.subjective?.allergiesMentioned ?? []),
+    ]);
+    merged.soap!.subjective!.patientConcerns = dedupeStrings([
+      ...(merged.soap!.subjective!.patientConcerns ?? []),
+      ...(evidence.soap?.subjective?.patientConcerns ?? []),
+    ]);
+
+    merged.soap!.objective!.vitals = dedupeStrings([...(merged.soap!.objective!.vitals ?? []), ...(evidence.soap?.objective?.vitals ?? [])]);
+    merged.soap!.objective!.findings = dedupeStrings([
+      ...(merged.soap!.objective!.findings ?? []),
+      ...(evidence.soap?.objective?.findings ?? []),
+    ]);
+    merged.soap!.objective!.testsOrResults = dedupeStrings([
+      ...(merged.soap!.objective!.testsOrResults ?? []),
+      ...(evidence.soap?.objective?.testsOrResults ?? []),
+    ]);
+    merged.soap!.objective!.observations = dedupeStrings([
+      ...(merged.soap!.objective!.observations ?? []),
+      ...(evidence.soap?.objective?.observations ?? []),
+    ]);
+
+    merged.soap!.assessment!.summary = preferLongerString(
+      merged.soap!.assessment!.summary,
+      evidence.soap?.assessment?.summary ?? null,
+    );
+    merged.soap!.assessment!.diagnoses = mergeDiagnosisLists(
+      merged.soap!.assessment!.diagnoses ?? [],
+      evidence.soap?.assessment?.diagnoses ?? [],
+    );
+    merged.soap!.assessment!.differentials = dedupeStrings([
+      ...(merged.soap!.assessment!.differentials ?? []),
+      ...(evidence.soap?.assessment?.differentials ?? []),
+    ]);
+    merged.soap!.assessment!.redFlags = dedupeStrings([
+      ...(merged.soap!.assessment!.redFlags ?? []),
+      ...(evidence.soap?.assessment?.redFlags ?? []),
+    ]);
+
+    merged.soap!.plan!.medications = dedupeStrings([...(merged.soap!.plan!.medications ?? []), ...(evidence.soap?.plan?.medications ?? [])]);
+    merged.soap!.plan!.testsOrdered = dedupeStrings([
+      ...(merged.soap!.plan!.testsOrdered ?? []),
+      ...(evidence.soap?.plan?.testsOrdered ?? []),
+    ]);
+    merged.soap!.plan!.referrals = dedupeStrings([...(merged.soap!.plan!.referrals ?? []), ...(evidence.soap?.plan?.referrals ?? [])]);
+    merged.soap!.plan!.followUp = dedupeStrings([...(merged.soap!.plan!.followUp ?? []), ...(evidence.soap?.plan?.followUp ?? [])]);
+    merged.soap!.plan!.patientInstructions = dedupeStrings([
+      ...(merged.soap!.plan!.patientInstructions ?? []),
+      ...(evidence.soap?.plan?.patientInstructions ?? []),
+    ]);
+    merged.soap!.plan!.clinicianTasks = dedupeStrings([
+      ...(merged.soap!.plan!.clinicianTasks ?? []),
+      ...(evidence.soap?.plan?.clinicianTasks ?? []),
+    ]);
+    merged.soap!.plan!.lifestyleAdvice = dedupeStrings([
+      ...(merged.soap!.plan!.lifestyleAdvice ?? []),
+      ...(evidence.soap?.plan?.lifestyleAdvice ?? []),
+    ]);
+
+    merged.quality!.missingInformation = dedupeStrings([
+      ...(merged.quality!.missingInformation ?? []),
+      ...(evidence.quality?.missingInformation ?? []),
+    ]);
+    merged.quality!.ambiguities = dedupeStrings([...(merged.quality!.ambiguities ?? []), ...(evidence.quality?.ambiguities ?? [])]);
+    merged.quality!.notes = dedupeStrings([...(merged.quality!.notes ?? []), ...(evidence.quality?.notes ?? [])]);
+    merged.transcript!.segments = mergeTranscriptSegments(
+      merged.transcript!.segments ?? [],
+      evidence.transcript?.segments ?? [],
+    );
+  }
+
+  return merged;
+}
+
+function buildHeuristicConsultationReportCandidate(evidence: ConsultationExtractionEvidence, synthesisError: string) {
+  const summaryBullets = evidence.summary?.bullets?.length ? evidence.summary.bullets : buildHeuristicSummaryBullets(evidence);
+  const summaryLine =
+    evidence.summary?.oneLiner ??
+    summaryBullets[0] ??
+    evidence.soap?.subjective?.chiefComplaint ??
+    evidence.visit?.visitReason ??
+    "Consultation note generated from partial extraction.";
+
+  return {
+    language: {
+      detected: evidence.language?.detected ?? "unknown",
+      reportLanguage: "en",
+    },
+    visit: {
+      visitReason: evidence.visit?.visitReason ?? evidence.soap?.subjective?.chiefComplaint ?? "",
+      clinicianName: evidence.visit?.clinicianName ?? null,
+      patientName: evidence.visit?.patientName ?? null,
+      visitType: normalizeConsultationVisitType(evidence.visit?.visitType, "unknown") ?? "unknown",
+    },
+    summary: {
+      oneLiner: summaryLine,
+      bullets: summaryBullets,
+    },
+    soap: {
+      subjective: {
+        chiefComplaint: evidence.soap?.subjective?.chiefComplaint ?? evidence.visit?.visitReason ?? "",
+        hpi: evidence.soap?.subjective?.hpi ?? "",
+        symptoms: evidence.soap?.subjective?.symptoms ?? [],
+        history: evidence.soap?.subjective?.history ?? [],
+        medicationsMentioned: evidence.soap?.subjective?.medicationsMentioned ?? [],
+        allergiesMentioned: evidence.soap?.subjective?.allergiesMentioned ?? [],
+        patientConcerns: evidence.soap?.subjective?.patientConcerns ?? [],
+      },
+      objective: {
+        vitals: evidence.soap?.objective?.vitals ?? [],
+        findings: evidence.soap?.objective?.findings ?? [],
+        testsOrResults: evidence.soap?.objective?.testsOrResults ?? [],
+        observations: evidence.soap?.objective?.observations ?? [],
+      },
+      assessment: {
+        summary: evidence.soap?.assessment?.summary ?? "",
+        diagnoses: evidence.soap?.assessment?.diagnoses ?? [],
+        differentials: evidence.soap?.assessment?.differentials ?? [],
+        redFlags: evidence.soap?.assessment?.redFlags ?? [],
+      },
+      plan: {
+        medications: evidence.soap?.plan?.medications ?? [],
+        testsOrdered: evidence.soap?.plan?.testsOrdered ?? [],
+        referrals: evidence.soap?.plan?.referrals ?? [],
+        followUp: evidence.soap?.plan?.followUp ?? [],
+        patientInstructions: evidence.soap?.plan?.patientInstructions ?? [],
+        clinicianTasks: evidence.soap?.plan?.clinicianTasks ?? [],
+        lifestyleAdvice: evidence.soap?.plan?.lifestyleAdvice ?? [],
+      },
+    },
+    quality: {
+      missingInformation: dedupeStrings([
+        ...(evidence.quality?.missingInformation ?? []),
+        "Full AI consultation synthesis was unavailable, so the report used a merged-evidence fallback.",
+      ]),
+      ambiguities: dedupeStrings([...(evidence.quality?.ambiguities ?? []), synthesisError]),
+    },
+    transcript: {
+      fullText: "",
+      segments: evidence.transcript?.segments?.length ? evidence.transcript.segments : [],
+    },
+  };
+}
+
+function mergeReportWithEvidence(report: ConsultationReport, evidence?: ConsultationExtractionEvidence): ConsultationReport {
+  if (!evidence) {
+    return report;
+  }
+
+  const mergedSegments = mergeTranscriptSegments(report.transcript.segments ?? [], evidence.transcript?.segments ?? []);
+  const summaryBullets = dedupeStrings([...report.summary.bullets, ...(evidence.summary?.bullets ?? [])]);
+
+  return {
+    ...report,
+    language: {
+      detected:
+        report.language.detected && report.language.detected !== "unknown"
+          ? report.language.detected
+          : evidence.language?.detected ?? "unknown",
+      reportLanguage: "en",
+    },
+    visit: {
+      visitReason:
+        report.visit.visitReason ||
+        evidence.visit?.visitReason ||
+        evidence.soap?.subjective?.chiefComplaint ||
+        report.visit.visitReason,
+      clinicianName: report.visit.clinicianName ?? evidence.visit?.clinicianName ?? null,
+      patientName: report.visit.patientName ?? evidence.visit?.patientName ?? null,
+      visitType: normalizeConsultationVisitType(report.visit.visitType, evidence.visit?.visitType ?? "unknown") ?? "unknown",
+    },
+    summary: {
+      oneLiner:
+        report.summary.oneLiner ||
+        evidence.summary?.oneLiner ||
+        summaryBullets[0] ||
+        evidence.visit?.visitReason ||
+        report.summary.oneLiner,
+      bullets: summaryBullets,
+    },
+    soap: {
+      subjective: {
+        chiefComplaint:
+          report.soap.subjective.chiefComplaint || evidence.soap?.subjective?.chiefComplaint || report.soap.subjective.chiefComplaint,
+        hpi: report.soap.subjective.hpi || evidence.soap?.subjective?.hpi || report.soap.subjective.hpi,
+        symptoms: dedupeStrings([...report.soap.subjective.symptoms, ...(evidence.soap?.subjective?.symptoms ?? [])]),
+        history: dedupeStrings([...report.soap.subjective.history, ...(evidence.soap?.subjective?.history ?? [])]),
+        medicationsMentioned: dedupeStrings([
+          ...report.soap.subjective.medicationsMentioned,
+          ...(evidence.soap?.subjective?.medicationsMentioned ?? []),
+        ]),
+        allergiesMentioned: dedupeStrings([
+          ...report.soap.subjective.allergiesMentioned,
+          ...(evidence.soap?.subjective?.allergiesMentioned ?? []),
+        ]),
+        patientConcerns: dedupeStrings([
+          ...report.soap.subjective.patientConcerns,
+          ...(evidence.soap?.subjective?.patientConcerns ?? []),
+        ]),
+      },
+      objective: {
+        vitals: dedupeStrings([...report.soap.objective.vitals, ...(evidence.soap?.objective?.vitals ?? [])]),
+        findings: dedupeStrings([...report.soap.objective.findings, ...(evidence.soap?.objective?.findings ?? [])]),
+        testsOrResults: dedupeStrings([
+          ...report.soap.objective.testsOrResults,
+          ...(evidence.soap?.objective?.testsOrResults ?? []),
+        ]),
+        observations: dedupeStrings([...report.soap.objective.observations, ...(evidence.soap?.objective?.observations ?? [])]),
+      },
+      assessment: {
+        summary: report.soap.assessment.summary || evidence.soap?.assessment?.summary || report.soap.assessment.summary,
+        diagnoses: mergeDiagnosisLists(report.soap.assessment.diagnoses, evidence.soap?.assessment?.diagnoses ?? []),
+        differentials: dedupeStrings([
+          ...report.soap.assessment.differentials,
+          ...(evidence.soap?.assessment?.differentials ?? []),
+        ]),
+        redFlags: dedupeStrings([...report.soap.assessment.redFlags, ...(evidence.soap?.assessment?.redFlags ?? [])]),
+      },
+      plan: {
+        medications: dedupeStrings([...report.soap.plan.medications, ...(evidence.soap?.plan?.medications ?? [])]),
+        testsOrdered: dedupeStrings([...report.soap.plan.testsOrdered, ...(evidence.soap?.plan?.testsOrdered ?? [])]),
+        referrals: dedupeStrings([...report.soap.plan.referrals, ...(evidence.soap?.plan?.referrals ?? [])]),
+        followUp: dedupeStrings([...report.soap.plan.followUp, ...(evidence.soap?.plan?.followUp ?? [])]),
+        patientInstructions: dedupeStrings([
+          ...report.soap.plan.patientInstructions,
+          ...(evidence.soap?.plan?.patientInstructions ?? []),
+        ]),
+        clinicianTasks: dedupeStrings([...report.soap.plan.clinicianTasks, ...(evidence.soap?.plan?.clinicianTasks ?? [])]),
+        lifestyleAdvice: dedupeStrings([...report.soap.plan.lifestyleAdvice, ...(evidence.soap?.plan?.lifestyleAdvice ?? [])]),
+      },
+    },
+    quality: {
+      missingInformation: dedupeStrings([...report.quality.missingInformation, ...(evidence.quality?.missingInformation ?? [])]),
+      ambiguities: dedupeStrings([...report.quality.ambiguities, ...(evidence.quality?.ambiguities ?? [])]),
+    },
+    transcript: {
+      fullText: report.transcript.fullText,
+      segments: mergedSegments.length ? mergedSegments : report.transcript.segments,
+    },
+  };
 }
 
 async function editStructuredReportAsync(report: ConsultationReport, instruction: string) {
@@ -561,35 +1529,41 @@ async function editStructuredReportAsync(report: ConsultationReport, instruction
   return consultationReportSchema.parse(finalReport);
 }
 
-function normalizeReport(input: unknown, transcript: string, audio: PendingAudio, privacyMode: boolean) {
+function normalizeReport(input: unknown, transcript: string, audio: PendingAudio, privacyMode: boolean): ConsultationReport {
   const report = typeof input === "object" && input ? ({ ...(input as Record<string, unknown>) } as Record<string, unknown>) : {};
+  const sourceAudio = readObject(report.sourceAudio);
+  const language = readObject(report.language);
+  const privacy = readObject(report.privacy);
+  const transcriptObject = readObject(report.transcript);
+  const visit = readObject(report.visit);
 
   return {
     id: String(report.id ?? `report-${Date.now()}`),
     createdAt: typeof report.createdAt === "string" ? report.createdAt : new Date().toISOString(),
     sourceAudio: {
+      ...sourceAudio,
       fileName: audio.fileName ?? null,
       durationSec: audio.durationSec ?? null,
       sourceType: audio.sourceType,
-      ...readObject(report.sourceAudio),
     },
     language: {
-      detected: "unknown",
+      ...language,
+      detected: typeof language.detected === "string" ? language.detected : "unknown",
       reportLanguage: "en",
-      ...readObject(report.language),
     },
     privacy: {
+      ...privacy,
       mode: privacyMode ? "redacted" : "standard",
       transcriptRedacted: privacyMode,
       transcriptExcludedFromPdf: privacyMode,
-      ...readObject(report.privacy),
     },
     visit: {
-      visitReason: "",
-      clinicianName: null,
-      patientName: null,
-      visitType: "unknown",
-      ...readObject(report.visit),
+      ...visit,
+      visitReason: typeof visit.visitReason === "string" ? visit.visitReason : "",
+      clinicianName:
+        typeof visit.clinicianName === "string" || visit.clinicianName === null ? visit.clinicianName : null,
+      patientName: typeof visit.patientName === "string" || visit.patientName === null ? visit.patientName : null,
+      visitType: readVisitType(visit.visitType, "unknown"),
     },
     summary: {
       oneLiner: "",
@@ -639,7 +1613,7 @@ function normalizeReport(input: unknown, transcript: string, audio: PendingAudio
     },
     transcript: {
       fullText: transcript,
-      ...readObject(report.transcript),
+      segments: Array.isArray(transcriptObject.segments) ? transcriptObject.segments : undefined,
     },
   };
 }
@@ -750,7 +1724,7 @@ function finalizeReportForStorage(report: ConsultationReport, audio: PendingAudi
   };
 }
 
-async function qwenChatCompletionAsync(body: Record<string, unknown>) {
+async function qwenChatCompletionAsync(body: Record<string, unknown>, timeoutMs = QWEN_REQUEST_TIMEOUT_MS) {
   let response: Response;
 
   try {
@@ -761,11 +1735,11 @@ async function qwenChatCompletionAsync(body: Record<string, unknown>) {
         Authorization: `Bearer ${DASHSCOPE_API_KEY}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(QWEN_REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     if (isAbortError(error)) {
-      throw new Error(`Qwen request timed out after ${Math.round(QWEN_REQUEST_TIMEOUT_MS / 1000)} seconds.`);
+      throw new Error(`Qwen request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
     }
 
     throw error;
@@ -779,37 +1753,118 @@ async function qwenChatCompletionAsync(body: Record<string, unknown>) {
   return response.json();
 }
 
-async function parseOrRepairJsonAsync(raw: string) {
+async function parseOrRepairJsonAsync(
+  raw: string,
+  options?: {
+    preferClaude?: boolean;
+    repairTimeoutMs?: number;
+  },
+) {
   const parsed = parseJsonLike(raw);
   if (parsed) {
     return parsed;
   }
 
-  const repairCompletion = await qwenChatCompletionAsync({
-    model: QWEN_REPAIR_MODEL,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Fix the user's malformed JSON into valid JSON only. Do not add markdown fences. Preserve the same information and do not invent missing facts.",
-      },
-      {
-        role: "user",
-        content: raw,
-      },
-    ],
-    response_format: {
-      type: "json_object",
-    },
-    enable_thinking: false,
-  });
+  const repairTimeoutMs = options?.repairTimeoutMs ?? QWEN_JSON_REPAIR_TIMEOUT_MS;
+  const repairOrder = options?.preferClaude ? ["claude", "qwen"] : ["qwen", "claude"];
 
-  const repaired = parseJsonLike(extractMessageText(repairCompletion));
-  if (!repaired) {
-    throw new Error("Model output was not valid JSON after repair.");
+  for (const strategy of repairOrder) {
+    try {
+      if (strategy === "claude" && ANTHROPIC_API_KEY && CLAUDE_MODEL) {
+        const repairedText = await claudeTextCompletionAsync({
+          systemPrompt:
+            "Fix the user's malformed JSON into valid JSON only. Do not add markdown fences. Preserve the same information and do not invent missing facts.",
+          userPrompt: raw,
+          maxTokens: 2400,
+          timeoutMs: repairTimeoutMs,
+        });
+        const repaired = parseJsonLike(repairedText);
+        if (repaired) {
+          return repaired;
+        }
+      }
+
+      if (strategy === "qwen") {
+        const repairCompletion = await qwenChatCompletionAsync(
+          {
+            model: QWEN_REPAIR_MODEL,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Fix the user's malformed JSON into valid JSON only. Do not add markdown fences. Preserve the same information and do not invent missing facts.",
+              },
+              {
+                role: "user",
+                content: raw,
+              },
+            ],
+            response_format: {
+              type: "json_object",
+            },
+            enable_thinking: false,
+          },
+          repairTimeoutMs,
+        );
+
+        const repaired = parseJsonLike(extractMessageText(repairCompletion));
+        if (repaired) {
+          return repaired;
+        }
+      }
+    } catch {
+      continue;
+    }
   }
 
-  return repaired;
+  throw new Error("Model output was not valid JSON after repair.");
+}
+
+async function claudeTextCompletionAsync({
+  systemPrompt,
+  userPrompt,
+  maxTokens,
+  timeoutMs = CLAUDE_REQUEST_TIMEOUT_MS,
+}: {
+  systemPrompt: string;
+  userPrompt: string;
+  maxTokens: number;
+  timeoutMs?: number;
+}) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY ?? "",
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: userPrompt,
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Claude request failed (${response.status}): ${await response.text()}`);
+  }
+
+  const payload = (await response.json()) as {
+    content?: Array<{ type?: string; text?: string }>;
+  };
+
+  return Array.isArray(payload.content)
+    ? payload.content
+        .map((item) => (item.type === "text" && typeof item.text === "string" ? item.text : ""))
+        .join("")
+    : "";
 }
 
 function extractMessageText(payload: any) {
@@ -1085,6 +2140,242 @@ function readVisitType(
   return value === "new" || value === "follow_up" || value === "urgent" || value === "unknown" ? value : fallback;
 }
 
+function normalizeConsultationVisitType(
+  value: unknown,
+  fallback: ConsultationReport["visit"]["visitType"] | null,
+): ConsultationReport["visit"]["visitType"] | null {
+  return value === "new" || value === "follow_up" || value === "urgent" || value === "unknown" ? value : fallback;
+}
+
+function normalizeConsultationDiagnosisArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as ConsultationReport["soap"]["assessment"]["diagnoses"];
+  }
+
+  const diagnoses: ConsultationReport["soap"]["assessment"]["diagnoses"] = [];
+
+  for (const item of value) {
+    const diagnosis = readObject(item);
+    const name = readNullableString(diagnosis.name, null)?.trim() || null;
+    const confidence = readDiagnosisConfidence(diagnosis.confidence, null);
+    if (!name || !confidence) {
+      continue;
+    }
+
+    diagnoses.push({
+      name,
+      confidence,
+    });
+  }
+
+  return diagnoses;
+}
+
+function normalizeConsultationSegments(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as NonNullable<ConsultationReport["transcript"]["segments"]>;
+  }
+
+  const segments: NonNullable<ConsultationReport["transcript"]["segments"]> = [];
+
+  for (const item of value) {
+    const segment = readObject(item);
+    const text = readNullableString(segment.text, null)?.trim() || null;
+    if (!text) {
+      continue;
+    }
+
+    const normalizedSegment: TranscriptSegment = {
+      speaker: normalizeTranscriptSpeaker(segment.speaker),
+      text,
+    };
+
+    if (typeof segment.startSec === "number" && Number.isFinite(segment.startSec)) {
+      normalizedSegment.startSec = segment.startSec;
+    }
+
+    if (typeof segment.endSec === "number" && Number.isFinite(segment.endSec)) {
+      normalizedSegment.endSec = segment.endSec;
+    }
+
+    segments.push(normalizedSegment);
+  }
+
+  return segments;
+}
+
+function normalizeTranscriptSpeaker(value: unknown): "doctor" | "patient" | "unknown" {
+  return value === "doctor" || value === "patient" || value === "unknown" ? value : "unknown";
+}
+
+function mergeDiagnosisLists(
+  left: ConsultationReport["soap"]["assessment"]["diagnoses"],
+  right: ConsultationReport["soap"]["assessment"]["diagnoses"],
+) {
+  const merged = new Map<string, ConsultationReport["soap"]["assessment"]["diagnoses"][number]>();
+
+  for (const diagnosis of [...left, ...right]) {
+    const key = diagnosis.name.trim().toLowerCase();
+    const existing = merged.get(key);
+    if (!existing || diagnosisConfidenceRank(diagnosis.confidence) > diagnosisConfidenceRank(existing.confidence)) {
+      merged.set(key, diagnosis);
+    }
+  }
+
+  return Array.from(merged.values());
+}
+
+function diagnosisConfidenceRank(value: ConsultationReport["soap"]["assessment"]["diagnoses"][number]["confidence"]) {
+  switch (value) {
+    case "confirmed":
+      return 4;
+    case "likely":
+      return 3;
+    case "possible":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function mergeTranscriptSegments(
+  left: NonNullable<ConsultationReport["transcript"]["segments"]>,
+  right: ConsultationEvidenceSegment[],
+) {
+  const merged = new Map<string, NonNullable<ConsultationReport["transcript"]["segments"]>[number]>();
+
+  for (const segment of [...left, ...normalizeConsultationSegments(right)]) {
+    const text = segment.text.trim();
+    if (!text) {
+      continue;
+    }
+
+    const key = `${segment.speaker}:${text.toLowerCase()}`;
+    if (!merged.has(key)) {
+      merged.set(key, segment);
+    }
+  }
+
+  return Array.from(merged.values()).slice(0, 24);
+}
+
+function preferLongerString(current: string | null | undefined, candidate: string | null | undefined) {
+  const normalizedCurrent = typeof current === "string" ? current.trim() : "";
+  const normalizedCandidate = typeof candidate === "string" ? candidate.trim() : "";
+
+  if (!normalizedCandidate) {
+    return normalizedCurrent || null;
+  }
+
+  if (!normalizedCurrent || normalizedCandidate.length > normalizedCurrent.length + 8) {
+    return normalizedCandidate;
+  }
+
+  return normalizedCurrent;
+}
+
+function buildConsultationTranscriptWindows(transcript: string) {
+  const normalized = transcript.trim();
+  if (!normalized) {
+    return [{ index: 0, startChar: 0, endChar: 0, text: "" }] satisfies ConsultationTranscriptWindow[];
+  }
+
+  const windows: ConsultationTranscriptWindow[] = [];
+  let startChar = 0;
+
+  while (startChar < normalized.length) {
+    let endChar = Math.min(normalized.length, startChar + CONSULTATION_TRANSCRIPT_WINDOW_MAX_CHARS);
+    if (endChar < normalized.length) {
+      const boundary = findTranscriptBoundary(normalized, startChar, endChar);
+      if (boundary > startChar + Math.floor(CONSULTATION_TRANSCRIPT_WINDOW_MAX_CHARS * 0.6)) {
+        endChar = boundary;
+      }
+    }
+
+    const text = normalized.slice(startChar, endChar).trim();
+    if (text) {
+      windows.push({
+        index: windows.length,
+        startChar,
+        endChar,
+        text,
+      });
+    }
+
+    if (endChar >= normalized.length) {
+      break;
+    }
+
+    startChar = Math.max(endChar - CONSULTATION_TRANSCRIPT_WINDOW_OVERLAP_CHARS, startChar + 1);
+  }
+
+  return windows.length
+    ? windows
+    : [{ index: 0, startChar: 0, endChar: normalized.length, text: normalized }];
+}
+
+function findTranscriptBoundary(text: string, startChar: number, endChar: number) {
+  const window = text.slice(startChar, endChar);
+  const candidateOffsets = [
+    window.lastIndexOf("\n\n"),
+    window.lastIndexOf(". "),
+    window.lastIndexOf("? "),
+    window.lastIndexOf("! "),
+    window.lastIndexOf("\n"),
+    window.lastIndexOf(" "),
+  ].filter((offset) => offset > 0);
+
+  if (!candidateOffsets.length) {
+    return endChar;
+  }
+
+  return startChar + Math.max(...candidateOffsets) + 1;
+}
+
+function buildConsultationTranscriptExcerpt(transcript: string) {
+  const normalized = transcript
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+
+  if (normalized.length <= 4_000) {
+    return normalized;
+  }
+
+  const head = normalized.slice(0, 1_800).trim();
+  const middleStart = Math.max(0, Math.floor(normalized.length / 2) - 500);
+  const middle = normalized.slice(middleStart, middleStart + 1_000).trim();
+  const tail = normalized.slice(-1_200).trim();
+
+  return [head, "[... transcript condensed for synthesis ...]", middle, "[...]", tail].join("\n\n");
+}
+
+function buildFallbackTranscriptSegments(text: string, maxSegments: number) {
+  return text
+    .split(/\n{2,}|\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, maxSegments)
+    .map((line) => ({
+      speaker: "unknown" as const,
+      text: line.length > 320 ? `${line.slice(0, 317).trim()}...` : line,
+    }));
+}
+
+function buildHeuristicSummaryBullets(evidence: ConsultationExtractionEvidence) {
+  const bullets = [
+    evidence.visit?.visitReason ? `Visit reason: ${evidence.visit.visitReason}` : null,
+    evidence.soap?.subjective?.chiefComplaint ? `Chief complaint: ${evidence.soap.subjective.chiefComplaint}` : null,
+    ...(evidence.soap?.subjective?.symptoms ?? []).slice(0, 3).map((item) => `Symptom: ${item}`),
+    ...(evidence.soap?.objective?.findings ?? []).slice(0, 2).map((item) => `Finding: ${item}`),
+    ...(evidence.soap?.objective?.testsOrResults ?? []).slice(0, 2).map((item) => `Test/result: ${item}`),
+    ...(evidence.soap?.plan?.followUp ?? []).slice(0, 2).map((item) => `Follow-up: ${item}`),
+  ].filter((item): item is string => Boolean(item));
+
+  return dedupeStrings(bullets).slice(0, 6);
+}
+
 function parseSourceType(value: unknown): PendingAudio["sourceType"] {
   return value === "recorded" || value === "sample" || value === "imported" ? value : "sample";
 }
@@ -1159,7 +2450,7 @@ async function prepareAudioChunksAsync(inputPath: string) {
       "-f",
       "segment",
       "-segment_time",
-      "240",
+      String(ASR_SEGMENT_SECONDS),
       "-ac",
       "1",
       "-ar",
